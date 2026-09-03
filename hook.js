@@ -69,6 +69,83 @@
     } catch (e) { /* 忽略 */ }
   }
 
+  // ── Agent SSE 流「伪造结束」包装（方案A：解页面卡死「生成中」）──
+  // 背景：预发服务端保持长连接，SSE 流永不 close（entry.done 恒 false），页面 React 因此
+  //   永远停在「生成中」（停止按钮常驻、输入框 disabled）；而实测：内容输出后再点「停止」
+  //   会触发 systemPrompt.content 崩溃，reload 又会丢插件面板数据。
+  // 做法：把交给页面的响应体换成我们可控的 ReadableStream——正常转发字节（同时解码累积进
+  //   entry.raw 供后台捕获），一旦「已见答案段 + 数据停滞超阈值」就主动 controller.close()，
+  //   页面 reader 收到正常的「流结束」信号 → React 自然收尾 → 输入框恢复、停止按钮消失。
+  //   全程不点停止、不 reload、不丢数据。仅影响 qa/chat 流式响应，其余请求原样透传。
+  const CHAT_STALL_CLOSE_MS = 8000; // 答案出现后，数据停滞多久判定「已出完」并伪造结束
+  const DEAD_STREAM_CLOSE_MS = 20000; // 未见答案段时的「死流兜底」：零字节持续多久强制解卡
+  function wrapChatStream(r, url) {
+    try {
+      // 无流式 body（错误响应/空响应/非流式）→ 原样返回，不改变页面既有行为
+      if (!r || !r.body || !r.body.getReader) return r;
+      const entry = { url: String(url).slice(0, 200), start: Date.now(), raw: '', done: false, err: '', chunks: 0 };
+      // 多条流并存：一次 RCA 会有多条 chat.json（工具调用轮 + 最终答案轮），
+      // 新流追加到数组末尾，旧轮保留，background 取「最后一条含答案段的流」
+      if (!Array.isArray(window.__QC_AGENT_STREAMS__) || window.__QC_AGENT_STREAMS__.length >= 10) {
+        window.__QC_AGENT_STREAMS__ = [];
+      }
+      window.__QC_AGENT_STREAMS__.push(entry);
+      window.__QC_AGENT_STREAM__ = entry;
+
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let closed = false;
+      let sawAnswer = false;         // 是否已收到「答案段」（type 非 think/tool）——只在正式回复开始后才允许关流
+      let lastChunkAt = Date.now();  // 最近一次收到字节的时间（停滞判定基准）
+      let wd = null;                 // 看门狗定时器句柄
+
+      const stream = new ReadableStream({
+        start(controller) {
+          const finish = () => {
+            if (closed) return;
+            closed = true;
+            if (wd) { clearInterval(wd); wd = null; }
+            try { controller.close(); } catch (e) { /* 已关闭 */ }
+            entry.done = true; // 同步告知后台：本流已结束（后台 complete 判定会用到）
+          };
+          (function pump() {
+            reader.read().then((cr) => {
+              if (closed) return;
+              if (cr.done) { finish(); return; }
+              lastChunkAt = Date.now();
+              try {
+                const txt = decoder.decode(cr.value, { stream: true });
+                entry.raw += txt; entry.chunks++;
+                if (entry.raw.length > 2000000) entry.raw = entry.raw.slice(-1500000); // 上限保护
+                // 答案段探测：SSE JSON 里出现 "type":"<非 think/tool 开头>" 即视为已产出正式回复
+                // （与 background.extractStreamText 的 noise 判定一致：think/tool 为思考与工具轮）
+                if (!sawAnswer && /"type"\s*:\s*"(?!think|tool)[^"]+"/i.test(entry.raw)) sawAnswer = true;
+              } catch (e) { /* 解码失败不影响转发 */ }
+              try { controller.enqueue(cr.value); } catch (e) { finish(); return; }
+              pump();
+            }).catch((e) => { entry.err = String(e && e.message || e); finish(); });
+          })();
+          // 看门狗：数据停滞时伪造结束，解页面卡死「生成中」。
+          //  - 已见答案段：停滞 CHAT_STALL_CLOSE_MS 即关（正常路径，答案已出完）；
+          //  - 未见答案段：需停滞更久（DEAD_STREAM_CLOSE_MS）才关，作「死流兜底」——
+          //    思考阶段数据是持续流动的（lastChunkAt 不断刷新）不会误关；只有真正长时间
+          //    零字节（流已死）才强制解卡，避免答案段探测失败时页面永久停在「生成中」。
+          wd = setInterval(() => {
+            if (closed) { clearInterval(wd); wd = null; return; }
+            const stalled = Date.now() - lastChunkAt;
+            const threshold = sawAnswer ? CHAT_STALL_CLOSE_MS : DEAD_STREAM_CLOSE_MS;
+            if (stalled >= threshold) {
+              try { reader.cancel(); } catch (e) { /* */ }
+              finish();
+            }
+          }, 1000);
+        }
+      });
+      // 用原响应的 status/statusText/headers 重建，页面侧读到的字节与原流一致，仅结束时机由我们控制
+      return new Response(stream, { status: r.status, statusText: r.statusText, headers: r.headers });
+    } catch (e) { return r; } // 任何异常都退回原始响应，绝不阻断页面
+  }
+
   // ── 钩子 1：window.fetch ──
   try {
     const origFetch = window.fetch;
@@ -107,48 +184,27 @@
               try { r.clone().json().then((j) => captureNamed('email', url, j, 'taskId')).catch(() => {}); } catch (e) { /* */ }
             }).catch(() => { /* */ });
           }
-          // Agent 回复流（SSE）网络层直捕：网络回调不受后台页签定时器节流影响，
-          // 页签在后台时数据照样逐块到达，供 background 直接读取，不再依赖页面渲染
-          try {
-            if (/qa\/chat/i.test(url)) {
-              // 记下发送时的请求体/请求头作模板：供后台「API 直连」模式复刻请求，
-              // 不碰页面 UI（后台节流不影响网络请求）
-              try {
-                const opts = arguments[1] || {};
-                window.__QC_CHAT_REQ__ = {
-                  url: String(url),
-                  method: opts.method || 'POST',
-                  body: typeof opts.body === 'string' ? opts.body.slice(0, 50000) : null,
-                  headers: opts.headers ? JSON.parse(JSON.stringify(opts.headers)) : null,
-                  time: Date.now()
-                };
-              } catch (e) { /* */ }
-              p.then((r) => {
-                try {
-                  const entry = { url: String(url).slice(0, 200), start: Date.now(), raw: '', done: false, err: '', chunks: 0 };
-                  // 多条流并存：一次 RCA 会有多条 chat.json（工具调用轮 + 最终答案轮），
-                  // 新流追加到数组末尾，旧轮保留，background 取「最后一条含答案段的流」
-                  if (!Array.isArray(window.__QC_AGENT_STREAMS__) || window.__QC_AGENT_STREAMS__.length >= 10) {
-                    window.__QC_AGENT_STREAMS__ = [];
-                  }
-                  window.__QC_AGENT_STREAMS__.push(entry);
-                  window.__QC_AGENT_STREAM__ = entry;
-                  const body = r.clone().body;
-                  if (!body || !body.getReader) { entry.done = true; entry.err = 'no-body'; return; }
-                  const reader = body.getReader();
-                  const decoder = new TextDecoder();
-                  (function pump() {
-                    reader.read().then((cr) => {
-                      if (cr.done) { entry.done = true; return; }
-                      try { entry.raw += decoder.decode(cr.value, { stream: true }); entry.chunks++; } catch (e) { /* */ }
-                      if (entry.raw.length > 2000000) entry.raw = entry.raw.slice(-1500000); // 上限保护
-                      pump();
-                    }).catch((e) => { entry.done = true; entry.err = String(e && e.message || e); });
-                  })();
-                } catch (e) { /* */ }
-              }).catch(() => { /* */ });
-            }
-          } catch (e) { /* */ }
+          // Agent 回复流（SSE）网络层直捕 + 「伪造流结束」解卡（方案A）：
+          // 网络回调不受后台页签定时器节流影响，页签在后台时数据照样逐块到达，供 background 读取。
+          // 预发服务端保持长连接、SSE 永不 close，页面 React 因此永停「生成中」；而内容输出后
+          // 再点「停止」会触发 systemPrompt.content 崩溃。故把交给页面的响应体换成 wrapChatStream
+          // 包装的可控流：数据停滞后主动 close()，页面收到自然结束信号 → React 收尾 → 输入框恢复。
+          if (/qa\/chat/i.test(url)) {
+            // 记下发送时的请求体/请求头作模板：供后台「API 直连」模式复刻请求，
+            // 不碰页面 UI（后台节流不影响网络请求）
+            try {
+              const opts = arguments[1] || {};
+              window.__QC_CHAT_REQ__ = {
+                url: String(url),
+                method: opts.method || 'POST',
+                body: typeof opts.body === 'string' ? opts.body.slice(0, 50000) : null,
+                headers: opts.headers ? JSON.parse(JSON.stringify(opts.headers)) : null,
+                time: Date.now()
+              };
+            } catch (e) { /* */ }
+            // 关键：返回「包装后的响应」给页面（而非原始 p），body 由 wrapChatStream 转发并可在停滞后关闭
+            return p.then((r) => wrapChatStream(r, url));
+          }
         } catch (e) { /* */ }
         return p;
       };
