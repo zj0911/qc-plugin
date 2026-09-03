@@ -1,42 +1,54 @@
 @echo off
 chcp 65001 >nul
-setlocal enabledelayedexpansion
-
-title 质检优化助手 - 安装
+title 质检优化助手 - 一键安装
 echo ================================
-echo   质检优化助手 v5.0.4 安装脚本
+echo   质检优化助手 v5.0.4 安装
 echo ================================
 echo.
 
-set "TARGET=%USERPROFILE%\qc-plugin"
+set "EXT_ID=mjigmdancgpbknlgnmgpbeokljdadfpl"
+set "UPDATE_URL=https://raw.githubusercontent.com/zj0911/qc-plugin/main/updates/extension.xml"
 
-:: 1. 创建目标文件夹
-if not exist "%TARGET%" mkdir "%TARGET%"
+:: 写入注册表：Chrome 会在下次启动时自动安装并保持更新
+reg add "HKCU\Software\Policies\Google\Chrome\ExtensionInstallForcelist" /v 1 /t REG_SZ /d "%EXT_ID%;%UPDATE_URL%" /f >nul 2>&1
 
-:: 2. 复制扩展文件
-echo [1/3] 复制扩展文件到 %TARGET% ...
-xcopy /E /Y /Q "%~dp0qc-plugin\*" "%TARGET%\" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo [√] 注册表已配置
+) else (
+    echo [X] 注册表写入失败，请以管理员身份运行
+    pause
+    exit /b 1
+)
 
-:: 3. 复制密钥文件（Chrome 需要扩展文件夹同级 .pem）
-echo [2/3] 复制密钥文件 ...
-copy /Y "%~dp0qc-plugin.pem" "%USERPROFILE%\qc-plugin.pem" >nul 2>&1
+echo.
+echo ================================
+echo   安装步骤：
+echo.
+echo   1. 完全关闭 Chrome（所有窗口）
+echo   2. 重新打开 Chrome
+echo   3. Chrome 会自动安装"质检优化助手"
+echo      首次可能需要点"启用扩展程序"
+echo.
+echo   之后每次发新版，Chrome 自动更新！
+echo ================================
+echo.
 
-:: 4. 打开扩展管理页面
-echo [3/3] 打开 Chrome 扩展管理页面 ...
+:: 关闭 Chrome
+taskkill /F /IM chrome.exe >nul 2>&1
+
+echo 正在关闭 Chrome...
+timeout /t 3 /nobreak >nul
+
+:: 重新打开 Chrome
+start chrome
+
+echo Chrome 已启动，等待几秒扩展会自动安装...
+timeout /t 8 /nobreak >nul
 start chrome "chrome://extensions"
-
 echo.
-echo ================================
-echo   请手动完成最后一步：
+echo 切换到打开的扩展管理页面，
+echo 应该能看到"质检优化助手"正在安装。
 echo.
-echo   1. 开启右上角"开发者模式"
-echo   2. 点击"加载已解压的扩展程序"
-echo   3. 选择文件夹: %TARGET%
-echo.
-echo   安装后扩展 ID 固定为:
-echo   mjigmdancgpbknlgnmgpbeokljdadfpl
-echo.
-echo   之后版本更新全自动，无需操作。
-echo ================================
+echo 扩展 ID: %EXT_ID%
 echo.
 pause
