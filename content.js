@@ -152,13 +152,29 @@
     return idx;
   }
 
+  // 块级标签：TreeWalker 逐个文本节点拼接时，在这些标签边界补 \n，还原 Markdown 分行结构。
+  // 预发把「### 第 N 条」「### 定位与修改」等标题渲染成 <h3>（### 被吃掉），文本节点与前后
+  // 粘连在同一行 → structureProblems 的「行首第 N 条」锚定失配、卡片解析为空（重载格式失败）。
+  const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'DIV', 'TR', 'BR', 'SECTION', 'ARTICLE', 'BLOCKQUOTE', 'TABLE', 'PRE']);
   function extractResult() {
     const userRows = collectChatUserRows();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
       acceptNode: (node) => inExcludedSource(node, userRows) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
     });
     let text = '';
-    while (walker.nextNode()) text += walker.currentNode.textContent;
+    let lastBlock = null;
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const t = node.textContent;
+      if (!t) continue; // 跳过空文本节点（布局间距 div 等）
+      // 找最近的块级祖先：跨块级边界时补一个 \n；同一块内多个文本节点
+      // （如 <li> 内的 <strong>「规则 ID：」+ <span>「 G11」）仍拼接在同一行，不被拆散。
+      let block = node.parentElement;
+      while (block && block.tagName && !BLOCK_TAGS.has(block.tagName)) block = block.parentElement;
+      if (lastBlock && block !== lastBlock && !/\n$/.test(text)) text += '\n';
+      text += t;
+      lastBlock = block;
+    }
 
     text = normalizeExtractText(text);
 
@@ -194,6 +210,10 @@
     text = text.replace(/→\s*扣分/g, '→ 扣分\n');
     text = text.replace(/→默认得分/g, '→ 默认得分\n');
     text = text.replace(/([^\n])(#{1,3}\s)/g, '$1\n\n$2');
+    // 「第 N 条：」标题被渲染成 <h3> 后 ### 丢失、与前后文粘连时，补换行还原行首
+    // （供 structureProblems 的「行首第 N 条」锚定）。只匹配「第 N 条：/第 N 条:」，
+    // 不会误伤正文里的「注意事项第 14 条已强调」这类引用（其后不接冒号）。
+    text = text.replace(/([^\n])(第\s*\d+\s*条\s*[：:])/g, '$1\n\n$2');
     text = text.replace(/([^\n])(---)/g, '$1\n\n$2');
     text = text.replace(/(---)([^\n])/g, '$1\n\n$2');
     text = text.replace(/([^\n-])(-\s)/g, '$1\n$2');
@@ -1753,7 +1773,7 @@
   // 确认态发送优化请求（「直接发送」按钮/60 秒倒计时到期共用），
   // 以当前已保存的 RCA（lastRcaText）为准。
   // 注：本轮「直接发送」不清会话（newSession=false）——RCA 生成轮可能刚结束流式输出，
-  // handleDrive → waitForReady 已点停止并等输入框恢复，直接在当前会话模拟人工粘贴发送即可；
+  // handleDrive → waitForReady 已等 hook.js 自动关流、输入框恢复，直接在当前会话模拟人工粘贴发送即可；
   // 此处再清会话会触发删除/新建会话操作叠加 React 渲染，易引发页面崩溃。
   function sendOptimizeWithRca() {
     if (!rcaAwaitingReview) return; // 防重复触发（按钮 + 倒计时竞争）
@@ -1822,9 +1842,12 @@
     console.warn('[QC 提取器] 对话回复格式化失败 | 长度:' + reply.length +
       ' | 含「## 优化结果」:' + hasMarker + ' | 含「第 N 条」:' + hasTitles +
       ' | 标记后正文预览:', norm.slice(previewStart, previewStart + 500));
-    setChatStatus('⚠️ 无法格式化（回复 ' + reply.length + ' 字' +
-      (hasMarker ? '' : '，未见「## 优化结果」标记') +
-      (hasTitles ? '' : '，未见「### 第 N 条」条目') + '），详情见控制台', 'warn');
+    // 区分两种「找不到可渲染的格式」：① 连「## 优化结果」标记都没有 → 格式完全不符；
+    // ② 有标记但无「第 N 条」条目（本轮多为「修改条数：0 条 / 无需修改」）→ 明确告知无可渲染条目。
+    setChatStatus(hasMarker
+      ? '⚠️ 已识别「## 优化结果」，但找不到可渲染的修改条目（本轮可能无需修改，回复 ' + reply.length + ' 字）'
+      : '⚠️ 找不到可渲染的格式（回复 ' + reply.length + ' 字，未见「## 优化结果」标记），详情见控制台',
+      'warn');
     return false;
   }
   
@@ -1868,8 +1891,19 @@
         return;
       }
       const problems = structureProblems(result, lastUserBubbleText());
+      // 诊断（仅手动重载时打印）：对比「第N条」总出现次数与落到行首的次数——
+      // 若总数 > 行首数，说明有标题没被还原到行首（会被 structureProblems 漏掉、卡片缺失）。
+      if (!silent) {
+        const totalTitles = (result.match(/第\s*\d+\s*条/g) || []).length;
+        const lineStartTitles = (result.match(/^#{0,6}\s*第\s*\d+\s*条/gm) || []).length;
+        console.log('[QC 重载格式] 解析卡片:', problems.length,
+          '| 「第N条」总出现:', totalTitles, '| 行首「第N条」:', lineStartTitles,
+          '\n提取文本:\n' + result.slice(0, 2000));
+      }
       if (!problems.length) {
-        if (!silent) showToast('⚠️ 提取到内容但未解析出条目，请等 Agent 输出结束后重试');
+        // 已提取到「## 优化结果」但无「第 N 条」条目：多为「修改条数：0 条 / 无需修改」，
+        // 明确告知找不到可渲染条目（而非含糊的「未解析出条目」）。
+        if (!silent) showToast('⚠️ 已提取「## 优化结果」，但找不到可渲染的修改条目（本轮可能无需修改）');
         return;
       }
       // 静默路线：页面内容与上次一致说明没有新的完整回复，不动状态也不重渲染
