@@ -361,6 +361,13 @@ async function handleDrive(keyword, skill, opts, sourceUrl) {
 
   const debug = { version: '4.17.23' };
 
+  // 环境判定：正式=ics.alipay.com，预发=ics-site-pre.alipay.com（正式清会话只保留「垃圾桶」）。
+  // 注：预发「非首轮 reload 页面」方案已废弃——reload 会连同插件面板（业务线/质检点/RCA 编辑框）
+  // 一起冲掉，导致 RCA 数据丢失。改由 hook.js「伪造 SSE 流结束」（wrapChatStream）解页面卡死：
+  // 流停滞后主动 close → React 自然收尾 → 输入框恢复，既不 reload、也不点「停止」，
+  // 从根本上避开「内容输出后点停止/新建会话 → systemPrompt.content 崩溃」与数据丢失。
+  const isFormal = !/pre\.alipay\.com/.test(String(sourceUrl || ''));
+
   // 清掉上一轮残留的流缓存（MAIN world；driveAgent 跑在 ISOLATED，写不到 MAIN 全局）
   const clearStreamCache = () => chrome.scripting.executeScript({
     target: { tabId: tab.id },
@@ -404,7 +411,7 @@ async function handleDrive(keyword, skill, opts, sourceUrl) {
     // 第一步：注入驱动脚本——切换 Skill、清空上一轮会话、填入 prompt 并发送，发完即返回
     // 环境由 sourceUrl 推导传入（正式=ics.alipay.com，预发=ics-site-pre.alipay.com）。
     // 正式环境清会话只保留「垃圾桶」：跳过「新建会话(方法0)」和「历史(方法2)」。
-    const isFormal = !/pre\.alipay\.com/.test(String(sourceUrl || ''));
+    // 注：isFormal 已在前文（路线二之前）计算，此处复用。
     // 崩溃自捕获钩子（MAIN world，幂等）：页面 React 一旦崩溃（如 reading 'content'），
     // 把「崩溃发生时的最后执行步骤」和错误信息写进 console + DOM data 属性，便于定位崩在哪一步。
     try {
@@ -426,6 +433,7 @@ async function handleDrive(keyword, skill, opts, sourceUrl) {
         }
       });
     } catch (e) { /* 钩子注入失败不阻断主流程 */ }
+
     let sent;
     try {
       const results = await chrome.scripting.executeScript({
@@ -846,65 +854,26 @@ async function handleRCA(prompt, sourceUrl, newSession) {
   return await handleDrive(prompt, '质检规则Agent', { skipDirectApi: true, newSession: !!newSession }, sourceUrl);
 }
 
-// 轮询注入探针，直到 Agent 页面聊天输入框可用
+// 轮询注入探针，直到 Agent 页面聊天输入框可用。
+// ⚠️ 方案A 后「不再点停止」：预发 SSE 流永不 close，页面会一直卡在「生成中」（停止按钮常驻、
+//    输入框 disabled）；而实测「内容输出后点停止」会触发 systemPrompt.content 崩溃。改由 hook.js
+//    的 wrapChatStream 在数据停滞后主动 close 流 → 页面 React 自然收尾 → 输入框恢复可编辑。
+//    这里只做纯轮询等待，把解卡完全交给 hook.js，避免任何程序化中断流导致的崩溃。
 async function waitForReady(tabId, maxWait = 60000) {
   const startedAt = Date.now();
-  // 防止对「生成中」状态反复点击停止：整个 waitForReady 期间最多点一次
-  let stopClicked = false;
-  // 首次检测到「生成中」的时间戳——不立即点停止。
-  // 人工点停止是在看到内容流式输出一阵之后；插件若在流式刚启动（React 状态最脆弱）就
-  // 立即 .click() 中断，平台会抛 TypeError: reading 'content'（message 对象还没建好就被掐）。
-  // 这里先等流式进入稳定推送状态（首次检测后 >=2.5s 且当前仍在生成中）再点，更贴近人工节奏。
-  let firstGeneratingAt = 0;
-  const STABLE_DELAY = 2500;
   for (;;) {
     try {
       const res = await chrome.scripting.executeScript({
         target: { tabId },
         func: () => {
-          // 1) 目标输入框出现且可编辑即就绪
+          // 目标输入框出现且可编辑即就绪（生成中时 placeholder 变为「AI 正在回复中...」且 disabled，
+          // 匹配不到就绪条件 → 继续轮询，等 hook.js 自动关流后页面恢复）
           const ta = document.querySelector('textarea[placeholder*="描述你想要的质检规则"]');
-          if (ta && !ta.disabled) return { ready: true };
-          // 2) 否则检测 agent 是否仍处于「生成中」（红色「停止」按钮可见）。
-          //    此时输入框 placeholder 变为「AI 正在回复中...」且 disabled，
-          //    目标 selector 匹配不到 → 不处理会一直轮询到超时返回 not-ready。
-          const stopBtn = Array.from(document.querySelectorAll('button')).find(el => {
-            const t = (el.textContent || '').trim();
-            return /停止|stop/i.test(t) && (el.className || '').toLowerCase().includes('danger');
-          });
-          return {
-            ready: false,
-            generating: !!stopBtn
-          };
+          return { ready: !!(ta && !ta.disabled) };
         }
       });
       const r = res && res[0] && res[0].result;
       if (r && r.ready) return true;
-      // 仍在生成中：等流式稳定后再点停止（首次检测后 >= STABLE_DELAY）。
-      // 正式 / 预发环境统一走这套逻辑（原先仅预发点停止，正式会一直轮询到超时 not-ready）。
-      // 这里只点一次，之后继续轮询等输入框恢复可编辑——这段轮询等待就是给 React 收尾的
-      // 自然停顿，避免停止后毫秒级就继续操作导致崩溃（人工操作时这几秒停顿正是关键）。
-      if (r && r.generating && !stopClicked) {
-        const now = Date.now();
-        if (firstGeneratingAt === 0) firstGeneratingAt = now;
-        const stable = now - firstGeneratingAt >= STABLE_DELAY;
-        if (stable) {
-          stopClicked = true;
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            func: () => {
-              const btn = Array.from(document.querySelectorAll('button')).find(el => {
-                const t = (el.textContent || '').trim();
-                return /停止|stop/i.test(t) && (el.className || '').toLowerCase().includes('danger');
-              });
-              if (btn) btn.click();
-            }
-          });
-          // 点完停止后额外等 1.5s，让平台 React 从流式中断状态收尾再继续轮询，
-          // 避免停止瞬间就读到中间态导致下一轮 executeScript 抛错。
-          await sleep(1500);
-        }
-      }
     } catch (e) { /* 页面尚未加载完成，继续等待 */ }
     if (Date.now() - startedAt > maxWait) return false;
     await sleep(1000);
@@ -919,7 +888,7 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
   console.log('[QC v4.17.23] driveAgent start, skillName=' + (skillName || '(none)') + ', isFormal=' + !!isFormal)
 
   // opts.newSession=false 表示「RCA 直接发送」轮，两个环境均沿用当前会话、不清会话
-  // （直接发送前 RCA 生成轮可能刚结束流式，waitForReady 已点停止并等输入框恢复，
+  // （直接发送前 RCA 生成轮可能刚结束流式，waitForReady 已等 hook.js 自动关流、输入框恢复，
   // 此时再清会话会叠加删除/新建操作触发 React 渲染崩溃）；
   // 其余情况（首轮生成 RCA / 用户新一轮提示词）维持每次清会话的既有行为。
   const shouldClearSession = !(opts && opts.newSession === false);
@@ -1104,13 +1073,51 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
   // ═══════════════════════════════════════
   // 预发环境：仅在新一轮（用户新发送提示词 / RCA 直发）时清会话；false 时沿用当前会话直接发。
   // 正式环境：维持「每次发送均清会话」的既有行为。
-  // 注：若前置 waitForReady 刚点击过「停止」，这里再额外等 1s 让页面从流式中断状态
-  // 彻底稳定后再操作会话，避免停止后毫秒级清会话叠加渲染触发 React 崩溃。
+  // ⚠️ 方案A 后全程不再程序化点「停止」：前置 waitForReady 已确保输入框可编辑（页面未卡「生成中」）；
+  //    若仍偶发卡在生成中（预发 SSE 流永不 close），交由 hook.js 的 wrapChatStream 数据停滞后自动
+  //    close 流解卡，这里只轮询等待页面恢复，绝不点停止（内容输出后点停止会触发 systemPrompt.content 崩溃）。
   if (shouldClearSession) {
-    markStep('2-clear-session', '进入清会话阶段（新一轮：停止后新建/删除会话）');
-    // 人节奏冷却：前置 waitForReady 刚点停止并等输入框恢复，这里再额外留白
-    // 让 React 从流式中断状态彻底收尾（人工点停止后也会停顿几秒才点新建/删除）
-    await sleep(2000);
+    markStep('2-clear-session', '进入清会话阶段（新一轮：等页面解卡后新建/删除会话）');
+    // 辅助判断：textarea placeholder 在生成中会变为「AI 正在回复中...」，
+    // 但停止按钮的检测优先于 textarea，避免 textarea 找不到时误判为“稳定”。
+    const isGenerating = () => {
+      try {
+        return Array.from(document.querySelectorAll('button')).some(el => {
+          const t = (el.textContent || '').trim();
+          return /停止|stop/i.test(t) && (el.className || '').toLowerCase().includes('danger');
+        });
+      } catch (e) { return false; }
+    };
+    const isTextareaReady = () => {
+      try {
+        const probe = document.querySelector('textarea[placeholder*="描述你想要的质检规则"]');
+        return !!(probe && !probe.disabled);
+      } catch (e) { return false; }
+    };
+    // 步骤 A：若页面仍卡在「生成中」，不再点「停止」——内容输出后点停止会触发 systemPrompt.content 崩溃。
+    // 改由 hook.js 的 wrapChatStream 在数据停滞后自动 close 流，页面 React 自然收尾；这里只轮询等其恢复可编辑。
+    if (isGenerating()) {
+      console.log('[QC v4.17.23] 检测到 Agent 仍在生成中，等待 hook.js 自动关流解卡（不点停止）');
+      // 等停止按钮消失（hook.js 关流后 React 收尾）+ textarea 恢复可用，最长 ~15s
+      for (let w = 0; w < 30; w++) {
+        if (!isGenerating() && isTextareaReady()) break;
+        await sleep(500);
+      }
+      await sleep(800); // 收尾后额外留白，确保 React 状态稳定再操作会话
+    }
+    // 步骤 B：持续稳定检测（textarea 可用 + 无停止按钮 连续 3s）。
+    // 不再在检测期间点「停止」——同样交给 hook.js 自动关流；这里仅在页面仍生成中时重置计时并等待。
+    const STABLE_REQUIRED = 3000;
+    let stableSince = Date.now();
+    for (let s = 0; s < 30; s++) {
+      const stableNow = isTextareaReady() && !isGenerating();
+      if (stableNow) {
+        if (Date.now() - stableSince >= STABLE_REQUIRED) break;
+      } else {
+        stableSince = Date.now();
+      }
+      await sleep(500);
+    }
     // 新对话也会有一条默认「欢迎语」assistant 气泡，不能以"气泡数为 0"判断清空成功；
     // 改为：记录清理前的气泡快照，清理后内容变化或仅剩欢迎语即视为成功。
     const bubbleTexts = () => Array.from(document.querySelectorAll('[class*="messageBubbleAssistant"]'))
@@ -1151,7 +1158,7 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
       }
       // ⚠️ 会话切换安抚（与「新建会话」同源）：删除当前会话同样是破坏性操作，
       // 连续第二轮时 React 仍持有上一会话状态，毫秒级直接删除会触发与 reading 'content'
-      // 同类的渲染崩溃。点前留白让 React 收尾（正式环境 waitForReady 点停止后已等过 2s，此处再补一档）。
+      // 同类的渲染崩溃。点前留白让 React 收尾（前面步骤 A/B 已等页面解卡稳定，此处再补一档）。
       await sleep(1200);
       delBtn.click();
       await sleep(1500);
@@ -1204,13 +1211,38 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
             while ((newBtn.disabled || newBtn.getAttribute && newBtn.getAttribute('aria-disabled') === 'true') && Date.now() - newT0 < 6000) {
               await sleep(200);
             }
-            // ⚠️ 会话切换安抚：点「新建会话」会让 React 重建会话，读到旧会话 systemPrompt 的
-            // .content=undefined 崩溃（日志里的 reading 'content' 就发生在此）。给 React 留白
-            // 完成上一会话 teardown -> 新会话 init，避免毫秒级压缩切换渲染触发崩溃。
-            await sleep(1200);
-            newBtn.click();
-            // 点后再留白一段，让新会话的首次渲染（systemPrompt 就绪）落地，再进入气泡轮询校验。
+            // ⚠️ v5.0.4 修复 reading 'content' 崩溃：人工点击「新建会话」不崩溃，
+            // 但代码 .click() 崩溃。差异在于：
+            //   1) .click() 只触发 click 事件，缺少 mousedown/mouseup（React/antd 依赖完整事件链）
+            //   2) 代码点击时页面可能尚未完全稳定（React 内部 state 仍在过渡）
+            // 修复：① 先等页面就绪（textarea 可编辑 + 无生成中）再操作；
+            //       ② 用完整鼠标事件链（mousedown → mouseup → click）模拟人工。
+            for (let r = 0; r < 15; r++) {
+              let ready = false;
+              try {
+                const probe = document.querySelector('textarea[placeholder*="描述你想要的质检规则"]');
+                const genStop = Array.from(document.querySelectorAll('button')).some(el => {
+                  const t = (el.textContent || '').trim();
+                  return /停止|stop/i.test(t) && (el.className || '').toLowerCase().includes('danger');
+                });
+                ready = !!(probe && !probe.disabled && !genStop);
+              } catch (e) { /* */ }
+              if (ready) break;
+              await sleep(500);
+            }
+            // 人工节奏留白：人工看到按钮 → 移鼠标 → 点击，中间有自然停顿
             await sleep(1500);
+            // ★ 模拟真实鼠标事件链（人工点击触发 mousedown → mouseup → click 完整序列）
+            // .click() 只触发 click 事件，缺少 mousedown/mouseup，antd 的 Button 组件
+            // 在 mousedown 阶段可能做状态准备（如 focus、active 态），缺失会导致
+            // React 在后续重渲染中读到中间态 state（systemPrompt = undefined）而崩溃。
+            const evtOpts = { bubbles: true, cancelable: true, view: window, button: 0 };
+            newBtn.dispatchEvent(new MouseEvent('mousedown', evtOpts));
+            await sleep(120);
+            newBtn.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+            newBtn.dispatchEvent(new MouseEvent('click', evtOpts));
+            // 点后再留白一段，让新会话的首次渲染（systemPrompt 就绪）落地，再进入气泡轮询校验。
+            await sleep(2000);
             // 用轮询等会话真正重置（与方法1 垃圾桶一致），而非单次 sleep+verify：
             // 预发点「新建会话」后旧气泡异步清除、欢迎语异步加载，固定 sleep(1500) 里
             // 页面往往还没重置完，单次 verifyCleared 返回 false 会误判为「点击无效」，
@@ -1404,8 +1436,8 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
   // 注：原本这里在预发环境会主动点击「停止」按钮来中断生成中的流式输出。
   // 但实测在预发平台点击「停止」后毫秒内就继续清会话/塞值会触发页面 React 崩溃
   // （流式中断时 message 为 undefined，渲染读 message.content 抛 TypeError: reading 'content'，
-  // 弹「Something went wrong」）。已改由前置 waitForReady 检测到生成中时先点停止，
-  // 然后持续轮询等输入框恢复可编辑——这段等待就是给 React 收尾的自然停顿（人工操作的几秒停顿是关键）。
+  // 弹「Something went wrong」）。方案A 后全程不再点停止：改由 hook.js 的 wrapChatStream 在数据停滞后
+  // 自动 close 流 → 页面 React 自然收尾 → 前置 waitForReady 纯轮询等输入框恢复可编辑。
   // 走到这里时页面应已稳定，下面再用模拟人工粘贴的方式填入 prompt。
   markStep('3-fill', '会话已清空，开始填入 RCA 分析文本');
 
@@ -1453,7 +1485,14 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
   // ① 文本域可编辑（非生成中）；② 无红「停止」按钮；③ 新会话欢迎语已上屏（= systemPrompt
   // 已提交到渲染树）——贴近人工打字后停顿几秒再点发送的节奏，避免重渲染读到中间态。
   markStep('4-send-wait', '发送前等待新会话 systemPrompt 就绪');
-  for (let tries = 0; tries < 12; tries++) {
+  // ⚠️ 发送边界加固 v2（修复预发环境 reading 'content' 崩溃）：
+  // 崩溃栈指向「点发送 → React 重渲染 → 读 systemPrompt.content → undefined 崩溃」。
+  // 根因：欢迎语气泡上屏 ≠ systemPrompt state 就绪（React 先渲染 DOM 后完成 state 提交）。
+  // 自适应策略：预发「新建会话」不产生欢迎语，仅等 textarea + 无停止按钮；
+  // 正式「垃圾桶」产生欢迎语，额外等欢迎语稳定 1.5s 确保 systemPrompt 已提交。
+  let welcomeDetectedAt = 0;
+  let welcomeEverSeen = false;
+  for (let tries = 0; tries < 25; tries++) {
     let taOk = false, genStop = false, welcomeOk = false;
     try {
       const probe = document.querySelector('textarea[placeholder*="描述你想要的质检规则"]');
@@ -1468,11 +1507,19 @@ async function driveAgent(keyword, skillName, opts, isFormal) {
           return /你好|我是质检规则助手|描述你想要的质检规则/.test(s);
         });
     } catch (e) { /* 页面中间态，继续等 */ }
-    if (taOk && !genStop && welcomeOk) break;
+    if (welcomeOk) welcomeEverSeen = true;
+    if (taOk && !genStop) {
+      if (!welcomeEverSeen) break; // 新建会话流程无欢迎语，textarea 就绪即走
+      // 垃圾桶流程：欢迎语已上屏，再等 1.5s 让 React 完成 systemPrompt state 提交
+      if (!welcomeDetectedAt) welcomeDetectedAt = Date.now();
+      if (Date.now() - welcomeDetectedAt >= 1500) break;
+    } else {
+      welcomeDetectedAt = 0;
+    }
     await sleep(400);
   }
   // 人工节奏留白：给 React 完成 systemPrompt 提交与重渲染，再触发发送点击
-  await sleep(600);
+  await sleep(800);
   // 最终兜底：点发送前再重新取一次按钮（避免中间态拿到的 btn 引用失效）
   const sendScope = ta.closest('div[class*="chatInput"]') || ta.parentElement || document;
   const sendBtns = sendScope.querySelectorAll('button.ant-btn-primary');
