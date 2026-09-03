@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "质检优化助手",
+  "version": "5.0.4",
+  "update_url": "https://raw.githubusercontent.com/zj0911/qc-plugin/main/updates/extension.xml",
+  "description": "质检助手：模式A 提取「优化结果」并定位高亮原文；模式B 输入复核任务ID生成评测集Excel（复用页面登录态，自动抓取评分/服务记录/质检点）。悬浮窗可拖拽缩放。v5.0.2 新增「先判断当前激活页」：仅处理前台焦点页签发起的请求，避免正式/预发多标签页同时触发。v5.0.3 修复清会话时误点「历史会话」：优先直点「新建会话」并显式排除历史入口。v5.0.4 直接发送前若检测到 agent 仍在生成（红色「停止」按钮），先点击停止、等输入框恢复可编辑后再发送。",
+  "permissions": ["tabs", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "质检助手：刷新当前页插件（就地重建/重新提取）",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://ics.alipay.com/*", "https://ics-site-pre.alipay.com/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://ics.alipay.com/*", "https://ics-site-pre.alipay.com/*"],
+      "js": ["hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

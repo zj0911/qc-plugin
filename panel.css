@@ -1,0 +1,676 @@
+/* ════════════════════════════════════
+   动画
+   ════════════════════════════════════ */
+@keyframes qcFadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes qcPulse { 0%, 100% { opacity: .5; } 50% { opacity: 1; } }
+@keyframes qcSlideLeft { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }
+
+/* ════════════════════════════════════
+   侧边栏
+   ════════════════════════════════════ */
+#qc-panel {
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.qc-toolbar-btn {
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.12);
+  color: #fff;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-family: system-ui, sans-serif;
+  transition: background 0.15s;
+}
+.qc-toolbar-btn:hover { background: rgba(255,255,255,0.26); }
+.qc-close-btn { font-size: 15px; padding: 4px 10px; line-height: 1; }
+
+/* ════════════════════════════════════
+   内容区
+   ════════════════════════════════════ */
+#qc-panel-body { font-size: 14px; word-break: break-word; }
+#qc-panel-body::-webkit-scrollbar { width: 8px; }
+#qc-panel-body::-webkit-scrollbar-thumb { background: #c4c7cc; border-radius: 4px; }
+#qc-panel-body::-webkit-scrollbar-thumb:hover { background: #9aa0a6; }
+
+/* ════════════════════════════════════
+   问题卡片
+   ════════════════════════════════════ */
+.qc-card {
+  background: #fff;
+  border: 1px solid #e6e8eb;
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+
+.qc-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.qc-card-title {
+  font-weight: 700;
+  font-size: 14.5px;
+  color: #1a1a2e;
+  flex: 1;
+}
+.qc-badge {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 12px;
+  white-space: nowrap;
+}
+.qc-badge-logic { background: #fdecea; color: #c62828; }
+.qc-badge-fmt    { background: #e3f2fd; color: #1565c0; }
+.qc-badge-other  { background: #eee; color: #555; }
+
+/* 问题描述 — 独立成行 */
+.qc-desc {
+  background: #fff8e1;
+  border-left: 4px solid #f9a825;
+  border-radius: 0 8px 8px 0;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+.qc-desc-label {
+  font-weight: 700;
+  font-size: 12px;
+  color: #e65100;
+  letter-spacing: 0.3px;
+  margin-bottom: 4px;
+}
+.qc-desc-body {
+  color: #333;
+  font-size: 13.5px;
+  line-height: 1.75;
+}
+
+/* 原文定位 + 修改方式列表 */
+.qc-detail-list { display: flex; flex-direction: column; gap: 8px; }
+.qc-detail-row {
+  position: relative;
+  padding: 9px 11px;
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  box-sizing: border-box;
+}
+.qc-locate-row { background: #eaf2fd; border-left: 3px solid #1a73e8; padding-right: 92px; }
+.qc-fix-row    { background: #e9f7ee; border-left: 3px solid #43a047; }
+.qc-detail-label {
+  font-weight: 700;
+  font-size: 12px;
+  margin-bottom: 3px;
+  letter-spacing: 0.3px;
+}
+.qc-locate-row .qc-detail-label { color: #1a73e8; }
+.qc-fix-row .qc-detail-label    { color: #2e7d32; }
+.qc-detail-body {
+  color: #333;
+  font-family: "SF Mono", "Fira Code", Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 定位原文按钮 */
+.qc-locate-btn {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  padding: 3px 10px;
+  background: #fff;
+  color: #1a73e8;
+  border: 1px solid #1a73e8;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.qc-locate-btn:hover { background: #1a73e8; color: #fff; }
+.qc-locate-btn:active { transform: scale(0.95); }
+
+/* 修改方式行右上角的复制按钮（绿色系，与修改方式行配色一致；布局仿定位按钮） */
+.qc-fix-copy-btn {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  padding: 3px 10px;
+  background: #fff;
+  color: #2e7d32;
+  border: 1px solid #43a047;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.qc-fix-copy-btn:hover { background: #43a047; color: #fff; }
+.qc-fix-copy-btn:active { transform: scale(0.95); }
+/* 编辑按钮：与复制按钮并排（复制在内、编辑靠边） */
+.qc-fix-edit-btn {
+  position: absolute;
+  top: 9px;
+  right: 78px;
+  padding: 3px 10px;
+  background: #fff;
+  color: #e65100;
+  border: 1px solid #fb8c00;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  transition: all 0.2s;
+}
+.qc-fix-edit-btn:hover { background: #fb8c00; color: #fff; }
+.qc-fix-edit-btn:active { transform: scale(0.95); }
+/* 含复制/编辑按钮的修改方式行右侧留白，避免文字被按钮压住 */
+.qc-fix-row:has(.qc-fix-copy-btn) { padding-right: 152px; }
+/* 编辑态：正文换成 textarea，恢复常规内边距 */
+.qc-fix-row.qc-fix-editing { padding-right: 11px; }
+.qc-fix-edit-ta {
+  width: 100%; min-height: 96px; box-sizing: border-box;
+  padding: 8px 10px; border: 1px solid #43a047; border-radius: 6px;
+  font-family: "SF Mono", "Fira Code", Consolas, "Courier New", monospace;
+  font-size: 12.5px; line-height: 1.7; resize: vertical; background: #fff;
+}
+.qc-fix-edit-ta:focus { outline: none; border-color: #2e7d32; box-shadow: 0 0 0 2px rgba(67, 160, 71, 0.18); }
+.qc-fix-edit-bar { display: flex; gap: 8px; margin-top: 6px; }
+.qc-fix-edit-save, .qc-fix-edit-cancel {
+  padding: 4px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  transition: all 0.15s; border: 1px solid transparent;
+}
+.qc-fix-edit-save { background: #43a047; color: #fff; }
+.qc-fix-edit-save:hover { background: #2e7d32; }
+.qc-fix-edit-cancel { background: #fff; color: #5f6368; border-color: #d0d5dc; }
+.qc-fix-edit-cancel:hover { background: #f1f3f4; }
+
+/* 卡片头部的「🎯 质检点」跳转按钮（标题 flex:1 已把按钮推到行尾） */
+.qc-jump-btn {
+  padding: 3px 10px;
+  background: #fff;
+  color: #1a73e8;
+  border: 1px solid #1a73e8;
+  border-radius: 14px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.qc-jump-btn:hover { background: #1a73e8; color: #fff; }
+.qc-jump-btn:active { transform: scale(0.95); }
+
+/* 跳转命中后的闪烁高亮（加在命中元素或其表格行上） */
+.qc-jump-flash { animation: qcJumpFlash 0.8s ease-in-out 4; border-radius: 4px; }
+@keyframes qcJumpFlash {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(255, 152, 0, 0.85); }
+}
+
+/* 小屏适配 */
+@media (max-width: 700px) {
+  .qc-locate-row { padding-right: 11px; }
+  .qc-locate-btn { position: static; margin-top: 6px; }
+  .qc-fix-row:has(.qc-fix-copy-btn) { padding-right: 11px; }
+  .qc-fix-copy-btn { position: static; margin-top: 6px; }
+  .qc-fix-edit-btn { position: static; margin-top: 6px; margin-left: 6px; }
+}
+
+/* ════════════════════════════════════
+   模式切换 Tab 条（优化结果 / 质检点详情）
+   ════════════════════════════════════ */
+#qc-mode-bar {
+  display: flex;
+  gap: 6px;
+  margin-top: 0;
+  padding: 8px 14px 10px;
+  flex-shrink: 0;
+  background: linear-gradient(135deg,#1a73e8,#1557b0);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+}
+.qc-mode-tab {
+  flex: 1;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.14);
+  color: rgba(255,255,255,0.9);
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.qc-mode-tab:hover { background: rgba(255,255,255,0.26); }
+.qc-mode-tab.active {
+  background: #fff;
+  color: #1557b0;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+}
+
+/* ════════════════════════════════════
+   质检点详情（模式 B）
+   ════════════════════════════════════ */
+/* 查询工具栏 */
+.qc-rules-bar { display: flex; gap: 8px; margin-bottom: 10px; }
+.qc-rules-input {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid #d0d5dc;
+  border-radius: 8px;
+  font-family: system-ui, sans-serif;
+  font-size: 13.5px;
+  outline: none;
+  background: #fff;
+  color: #1a1a2e;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.qc-rules-input:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 3px rgba(26,115,232,0.15);
+}
+.qc-rules-btn {
+  padding: 9px 18px;
+  border: none;
+  border-radius: 8px;
+  background: #1a73e8;
+  color: #fff;
+  font-family: system-ui, sans-serif;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.qc-rules-btn:hover { background: #1557b0; }
+.qc-rules-btn:active { transform: scale(0.97); }
+
+/* 查询状态 */
+.qc-rules-status {
+  font-size: 12.5px;
+  color: #888;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.qc-rules-status.info { color: #1a73e8; }
+.qc-rules-status.warn { color: #b26a00; }
+.qc-rules-status.ok   { color: #2e7d32; }
+.qc-rules-status.err  { color: #c62828; }
+
+/* 结果摘要 */
+.qc-rules-summary {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #1a73e8;
+  margin-bottom: 10px;
+}
+.qc-rules-summary.empty { color: #b26a00; }
+
+/* 质检点/规则卡片 */
+.qc-rules-card { padding-top: 12px; }
+.qc-rules-card .qc-card-title { font-size: 13.5px; }
+
+/* JSON 兜底展示 */
+.qc-rules-json {
+  margin-top: 12px;
+  border: 1px dashed #c4c7cc;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fafbfc;
+  font-size: 12px;
+  color: #555;
+}
+.qc-rules-json summary {
+  cursor: pointer;
+  font-weight: 600;
+  user-select: none;
+}
+.qc-rules-pre {
+  margin: 8px 0 0;
+  padding: 10px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  font-family: "SF Mono", Consolas, "Courier New", monospace;
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* 模式B·Agent 跨页签返回展示 */
+.qc-rules-agent {
+  border: 1px solid #d5e0f5;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #f7f9fe;
+}
+.qc-agent-head {
+  padding: 8px 12px;
+  background: #eaf0fb;
+  color: #1a56b8;
+  font-size: 12px;
+  font-weight: 700;
+  border-bottom: 1px solid #d5e0f5;
+}
+.qc-agent-body {
+  padding: 12px 14px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: #222;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 420px;
+  overflow: auto;
+}
+
+/* 加载中 */
+.qc-spinner {
+  width: 26px; height: 26px;
+  margin: 24px auto;
+  border: 3px solid #d0d5dc;
+  border-top-color: #1a73e8;
+  border-radius: 50%;
+  animation: qcSpin 0.8s linear infinite;
+}
+@keyframes qcSpin { to { transform: rotate(360deg); } }
+
+/* 查询失败提示 */
+.qc-error-box {
+  border: 1px solid #f3c1c1;
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: #fdf2f2;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #7b1f1f;
+}
+.qc-error-title { font-weight: 700; margin-bottom: 6px; color: #c62828; }
+.qc-error-hint { color: #8d6e6e; margin-top: 4px; }
+.qc-attempt {
+  font-family: "SF Mono", Consolas, "Courier New", monospace;
+  font-size: 11.5px;
+  color: #444;
+  word-break: break-all;
+  padding-left: 6px;
+}
+
+/* ===== 模式B·API 数据驱动 · 发布过滤 ===== */
+
+/* 汇总说明条（命中数/未识别到发布字段/已发布数） */
+.qc-rules-summary.warn {
+  color: #b26a00;
+  font-weight: 600;
+}
+
+/* 规则列表容器 */
+.qc-rule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+/* 仅显示已发布(Release) 过滤开关 */
+.qc-rel-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #333;
+  margin: 6px 0 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.qc-rel-filter input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: #1a73e8;
+  cursor: pointer;
+}
+
+/* 卡片元信息行：badge 集群 */
+.qc-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 8px;
+}
+
+/* 基础 badge（供各语义色复用） */
+.qc-badge,
+.qc-badge-fmt,
+.qc-badge-logic,
+.qc-badge-other {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* 已发布(Release) 语义 */
+.qc-badge-ok {
+  background: #e6f4ea;
+  color: #1e7e34;
+  border: 1px solid #a8d5b5;
+}
+
+/* 未发布 / 非 Release 语义 */
+.qc-badge-no {
+  background: #fce8e6;
+  color: #c5221f;
+  border: 1px solid #f0bcba;
+}
+
+/* 业务线语义 */
+.qc-badge-biz {
+  background: #e8f0fe;
+  color: #1a56b8;
+  border: 1px solid #c6dafc;
+}
+
+/* 元信息中的字段名小标签（如「发布状态: Release」） */
+.qc-meta-field {
+  font-size: 11px;
+  color: #777;
+  font-weight: 400;
+}
+
+/* 记录字段结构查看器 */
+.qc-rule-fields {
+  margin-top: 8px;
+  border: 1px dashed #cfd3dc;
+  border-radius: 6px;
+  padding: 8px 10px;
+  background: #fbfcfe;
+}
+.qc-rule-fields summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #5f6b7a;
+  user-select: none;
+}
+.qc-rule-fields pre {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #374151;
+  background: #f3f4f6;
+  border-radius: 5px;
+  padding: 8px;
+  overflow: auto;
+  max-height: 200px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: "SF Mono", Consolas, "Courier New", monospace;
+}
+
+/* 空结果提示 */
+.qc-rule-list .qc-rules-summary.empty {
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* ── 历史版本(Release) 面板 ── */
+.qc-vh-actions {
+  margin: 6px 0 4px;
+}
+.qc-vh-btn {
+  font-size: 12px;
+  font-weight: 600;
+  color: #1a56b8;
+  background: #e8f0fe;
+  border: 1px solid #c6dafc;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background .15s;
+}
+.qc-vh-btn:hover { background: #d9e6fd; }
+.qc-vh-btn:disabled { opacity: .6; cursor: wait; }
+
+.qc-vh-box {
+  margin-top: 8px;
+  border: 1px solid #e0e5ee;
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 8px 10px;
+}
+.qc-vh-box .qc-vh-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: #333;
+  margin: 0 0 6px;
+}
+.qc-vh-box .qc-vh-note,
+.qc-vh-box .qc-vh-loading,
+.qc-vh-box .qc-vh-error {
+  font-size: 11.5px;
+  color: #5f6b7a;
+  line-height: 1.6;
+  margin: 4px 0;
+}
+.qc-vh-box .qc-vh-error { color: #c5221f; }
+.qc-vh-list {
+  list-style: none;
+  margin: 0 0 6px;
+  padding: 0;
+  border: 1px solid #e5e8ef;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.qc-vh-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  padding: 4px 8px;
+  border-bottom: 1px solid #eef0f4;
+  color: #374151;
+}
+.qc-vh-item:last-child { border-bottom: none; }
+.qc-vh-item.qc-vh-current { background: #fffbe6; }
+.qc-vh-item .qc-vh-tag { font-weight: 600; }
+.qc-badge-ok, .qc-badge-no { font-size: 10.5px; padding: 1px 7px; }
+.qc-vh-sep {
+  border: none;
+  border-top: 1px dashed #d3d8e2;
+  margin: 8px 0;
+}
+.qc-vh-box .qc-rules-pre {
+  margin-top: 6px;
+  max-height: 260px;
+}
+
+/* ════════════════════════════════════
+   RCA 根因分析工作流
+   ════════════════════════════════════ */
+
+.qc-rca-panel { margin-top: 18px; border-top: 2px dashed #d0d4da; padding-top: 14px; }
+.qc-rca-head { font-weight: 700; font-size: 15px; color: #1a73e8; margin-bottom: 10px; }
+.qc-rca-section { margin-bottom: 10px; }
+.qc-rca-label { font-size: 12.5px; color: #5f6368; font-weight: 600; margin-bottom: 4px; }
+/* 规则原文折叠：默认隐藏 textarea，点击标题展开；内容保留在 DOM 中供 RCA 生成使用 */
+.qc-rca-toggle { cursor: pointer; user-select: none; }
+.qc-rca-toggle:hover { color: #1a73e8; }
+.qc-rca-arrow { display: inline-block; margin-right: 4px; font-size: 10px; transition: transform .15s; }
+.qc-rca-hint { font-weight: 400; color: #8ab4f8; margin-left: 6px; font-size: 11.5px; }
+.qc-rca-collapsed .qc-rca-textarea { display: none; }
+.qc-rca-textarea {
+  width: 100%; min-height: 60px; padding: 8px 10px; border: 1px solid #dadce0;
+  border-radius: 8px; font-size: 13px; font-family: inherit; resize: vertical;
+  box-sizing: border-box; background: #fff;
+}
+.qc-rca-textarea:focus { outline: none; border-color: #1a73e8; }
+.qc-rca-rule { background: #f8f9fa; color: #5f6368; }
+.qc-rca-actions { text-align: center; margin: 12px 0; }
+.qc-rca-btn {
+  background: linear-gradient(135deg,#1a73e8,#1557b0); color: #fff; border: none;
+  padding: 8px 20px; border-radius: 8px; font-size: 13.5px; cursor: pointer;
+  transition: filter .15s, transform .1s;
+}
+.qc-rca-btn:hover { filter: brightness(1.06); }
+.qc-rca-btn:active { transform: scale(0.97); }
+.qc-rca-btn:disabled { opacity: .6; cursor: not-allowed; }
+.qc-rca-result { margin-top: 10px; }
+.qc-rca-output-head { font-weight: 700; font-size: 14px; color: #188038; margin-bottom: 6px; }
+.qc-rca-output {
+  background: #fff; border: 1px solid #dadce0; border-radius: 10px; padding: 12px;
+  font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+  color: #3c4043; margin: 0; max-height: 420px; overflow: auto;
+}
+.qc-rca-copy {
+  margin-top: 8px; background: #fff; border: 1px solid #dadce0; color: #1a73e8;
+  padding: 6px 16px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+  transition: background .15s;
+}
+.qc-rca-copy:hover { background: #f1f3f4; }
+.qc-rca-empty { color: #c5221f; font-size: 13px; padding: 10px 0; }
+/* RCA 切换失败 debug 折叠区 */
+details.qc-rca-debug { margin-top: 8px; border-top: 1px dashed #d9d9d9; padding-top: 6px; }
+details.qc-rca-debug > summary { cursor: pointer; color: #d46b08; font-size: 12px; }
+pre.qc-rca-debug-pre { white-space: pre-wrap; word-break: break-all; font-size: 10px; background: #fafafa; border: 1px solid #eee; padding: 6px; max-height: 180px; overflow: auto; margin: 6px 0 0; }
+
+/* 模式 A：Agent 对话输入（置顶，只发不收） */
+.qc-chat-box { margin-bottom: 12px; border-bottom: 1px solid #e8eaed; padding-bottom: 10px; }
+.qc-chat-head { font-weight: 700; font-size: 14px; color: #1a73e8; margin-bottom: 8px; }
+.qc-chat-row { display: flex; gap: 8px; align-items: flex-end; }
+.qc-chat-input {
+  flex: 1; padding: 8px 10px; border: 1px solid #dadce0; border-radius: 8px;
+  font-size: 13px; font-family: inherit; resize: vertical; box-sizing: border-box; background: #fff;
+}
+.qc-chat-input:focus { outline: none; border-color: #1a73e8; }
+.qc-chat-send {
+  background: linear-gradient(135deg,#1a73e8,#1557b0); color: #fff; border: none;
+  padding: 8px 16px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  transition: filter .15s, transform .1s; white-space: nowrap;
+}
+.qc-chat-send:hover { filter: brightness(1.08); }
+.qc-chat-send:active { transform: scale(0.97); }
+.qc-chat-send:disabled { opacity: .6; cursor: not-allowed; }
+/* 状态提示：等待/完成/失败 */
+.qc-chat-status { margin-top: 8px; font-size: 12.5px; line-height: 1.5; color: #5f6368; }
+.qc-chat-status.info { color: #1a73e8; }
+.qc-chat-status.ok { color: #188038; }
+.qc-chat-status.warn { color: #b26a00; }
+.qc-chat-status.err { color: #c5221f; }
