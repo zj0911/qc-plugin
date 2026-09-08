@@ -9,6 +9,21 @@
     return;
   }
 
+  // ── 埋点辅助：content 侧把事件转发给 background（由 reporter 统一上报）──
+  // enrich = 公共字段（env/session/匿名 user hash 等），由本模块推导注入
+  function qcTrack(eventName, props) {
+  try {
+    const enrich = {
+      env: /-pre\.alipay\.com/i.test(location.hostname || '') ? 'pre' : 'formal'
+    };
+    chrome.runtime.sendMessage({
+      type: 'qc-track',
+      eventName: eventName,
+      props: Object.assign({}, enrich, props || {})
+    });
+  } catch (e) { /* 埋点失败不影响主流程 */ }
+}
+
   // ── 全局状态 ──
   let panelEl = null;          // 侧边栏根节点
   let lastExtracted = '';      // 模式 A：最新提取的原始结果文本
@@ -151,34 +166,24 @@
     }
     return idx;
   }
+  // 「## 优化结果」标记的第一次出现位置：从第一个结果块开始,合并所有轮次的块, zj新增函数可放在 lastMarkerIndex之后
+  // 避免 lastMarkerIndex 只保留最后一轮导致"只识别最后一条"
+  function firstMarkerIndex(text) {
+    const found = text.match(MARKER_PATTERN);
+    return found ? found.index : -1;
+  }
 
-  // 块级标签：TreeWalker 逐个文本节点拼接时，在这些标签边界补 \n，还原 Markdown 分行结构。
-  // 预发把「### 第 N 条」「### 定位与修改」等标题渲染成 <h3>（### 被吃掉），文本节点与前后
-  // 粘连在同一行 → structureProblems 的「行首第 N 条」锚定失配、卡片解析为空（重载格式失败）。
-  const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'DIV', 'TR', 'BR', 'SECTION', 'ARTICLE', 'BLOCKQUOTE', 'TABLE', 'PRE']);
   function extractResult() {
     const userRows = collectChatUserRows();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
       acceptNode: (node) => inExcludedSource(node, userRows) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
     });
     let text = '';
-    let lastBlock = null;
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const t = node.textContent;
-      if (!t) continue; // 跳过空文本节点（布局间距 div 等）
-      // 找最近的块级祖先：跨块级边界时补一个 \n；同一块内多个文本节点
-      // （如 <li> 内的 <strong>「规则 ID：」+ <span>「 G11」）仍拼接在同一行，不被拆散。
-      let block = node.parentElement;
-      while (block && block.tagName && !BLOCK_TAGS.has(block.tagName)) block = block.parentElement;
-      if (lastBlock && block !== lastBlock && !/\n$/.test(text)) text += '\n';
-      text += t;
-      lastBlock = block;
-    }
+    while (walker.nextNode()) text += walker.currentNode.textContent;
 
     text = normalizeExtractText(text);
 
-    const idx = lastMarkerIndex(text);
+    const idx = firstMarkerIndex(text); //zj 把:const idx = lastMarkerIndex(text);改成:const idx = firstMarkerIndex(text);
     if (idx < 0) return null;
     return sliceResultText(text.slice(idx));
   }
@@ -204,16 +209,13 @@
     text = text.replace(/\|\|/g, '|\n|');
     text = text.replace(/\n\|\n/g, '\n');
     text = text.replace(/^- -- (?=[^\n|\-])/gm, '');
+    text = text.replace(/([^\n])(#{0,3}\s*第\s*\d+\s*条\s*[：:])/g, '$1\n\n$2');
     text = text.replace(/([；。])([^\n])/g, '$1\n$2');
     text = text.replace(/([）\)])([^\n\s])/g, '$1\n$2');
     text = text.replace(/→\s*得分/g, '→ 得分\n');
     text = text.replace(/→\s*扣分/g, '→ 扣分\n');
     text = text.replace(/→默认得分/g, '→ 默认得分\n');
     text = text.replace(/([^\n])(#{1,3}\s)/g, '$1\n\n$2');
-    // 「第 N 条：」标题被渲染成 <h3> 后 ### 丢失、与前后文粘连时，补换行还原行首
-    // （供 structureProblems 的「行首第 N 条」锚定）。只匹配「第 N 条：/第 N 条:」，
-    // 不会误伤正文里的「注意事项第 14 条已强调」这类引用（其后不接冒号）。
-    text = text.replace(/([^\n])(第\s*\d+\s*条\s*[：:])/g, '$1\n\n$2');
     text = text.replace(/([^\n])(---)/g, '$1\n\n$2');
     text = text.replace(/(---)([^\n])/g, '$1\n\n$2');
     text = text.replace(/([^\n-])(-\s)/g, '$1\n$2');
@@ -230,7 +232,11 @@
   //   中间可能夹空格与质检点编号）；
   //   'ID：' 仅在前面不是「规则」时截（账户信息「ID：9277547」要截，「规则 ID：815」是合法头部字段）
   const CUT_GUARDS = {
-    '已完成': (result, i) => /^[\sA-Za-z0-9]{0,8}规则/.test(result.slice(i + 3, i + 15)),
+    '已完成': (result, i) => {
+      const pre = result.slice(Math.max(0, i - 8), i).replace(/[\s\n\r]+$/, '');
+      if (pre.endsWith('得分') || pre.endsWith('"') || pre.endsWith('"')) return false;
+      return /^[\sA-Za-z0-9]{0,8}规则/.test(result.slice(i + 3, i + 15));
+    },
     // 「规则 ID：815」中「规则」与「ID：」之间可能有空格，取 4 字符窗口再去尾空格判断
     'ID：': (result, i) => !result.slice(Math.max(0, i - 4), i).replace(/\s+$/, '').endsWith('规则')
   };
@@ -258,14 +264,14 @@
     // 保证切在最早的噪音处，不会因标记列表顺序漏切更早的噪音
     let cutAt = -1;
     for (const cut of cutMarkers) {
-      let cutIdx = result.indexOf(cut);
+      let cutIdx = result.lastIndexOf(cut); //zj
       // 带守卫的标记：跳过不满足上下文的位置，继续找下一个出现处
       while (cutIdx > 100 && CUT_GUARDS[cut] && !CUT_GUARDS[cut](result, cutIdx)) {
         const next = result.indexOf(cut, cutIdx + cut.length);
         if (next === -1) { cutIdx = -1; break; }
         cutIdx = next;
       }
-      if (cutIdx > 100 && (cutAt === -1 || cutIdx < cutAt)) cutAt = cutIdx;
+      if (cutIdx > 100 && (cutAt === -1 || cutIdx < cutAt)) cutAt = cutIdx; //zj
     }
     if (cutAt !== -1) result = result.slice(0, cutAt);
 
@@ -345,7 +351,7 @@
       const end = (i + 1 < titles.length) ? titles[i + 1] : t.length;
       const block = t.slice(start, end);
 
-      const firstLine = block.split('\n')[0].trim();
+      const firstLine = block.trim().split('\n')[0].trim();
       const title = firstLine.replace(/^#+\s*/, '').trim();
 
       // 类型：取标题最后「：」后的词，如「逻辑问题」「格式问题」
@@ -946,7 +952,8 @@
         navigator.clipboard.writeText(p.fix).then(() => {
           copyFixBtn.textContent = '✅ 已复制';
           setTimeout(() => (copyFixBtn.textContent = '📋 复制'), 1500);
-        }).catch(() => showToast('❌ 复制失败'));
+          qcTrack('优化结果复制', { result: 'success', reply_len: (p.fix || '').length, biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
+        }).catch(() => { showToast('❌ 复制失败'); qcTrack('优化结果复制', { result: 'fail', error_code: 'clipboard', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' }); });
       });
       // 编辑按钮：就地微调修改方式文本；保存后 p.fix 更新，复制/重渲染都用新内容
       const editFixBtn = document.createElement('button');
@@ -1008,10 +1015,12 @@
       if (v) p.fix = v;
       close();
       showToast('✅ 修改方式已更新');
+      qcTrack('优化规则编辑', { result: 'success', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
     });
     cancelBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       close();
+      qcTrack('优化规则编辑', { result: 'fail', reason: 'cancel', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
     });
   }
 
@@ -1020,8 +1029,22 @@
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         e.preventDefault();
+        const card = btn.closest('.qc-card');
+        const labelEl = card && card.querySelector('.qc-card-head .qc-card-title');
+        const title = labelEl ? labelEl.textContent.trim() : '';
+        const p = lastProblems.find(x => x.title === title);
+        const biz = (p && p.qcBizLine) || '';
+        const qp = (p && p.qcRefs && p.qcRefs[0]) || '';
         const enc = btn.getAttribute('data-locate');
-        if (enc) highlightOnPage(decodeURIComponent(enc));
+        const t0 = Date.now();
+        let located = false;
+        if (enc) {
+          try {
+            highlightOnPage(decodeURIComponent(enc));
+            located = true;
+          } catch (e) { /* 定位失败 */ }
+        }
+        qcTrack('原文定位', { result: located ? 'success' : 'fail', duration_ms: Date.now() - t0, biz, qp });
       });
     });
   }
@@ -1034,26 +1057,32 @@
   let qcJumpCleanup = null;
   async function jumpToQcPoint(refs, bizLine) {
     if (!refs || !refs.length) { showToast('⚠️ 该条目未解析出质检点信息'); return; }
+    const qpCode = (parseQcCode(refs[0]) && parseQcCode(refs[0]).core) || refs[0];
+    let found = false;
     const tree = document.querySelector('[class*="leftTree"]');
     const searchInput = document.querySelector('[class*="leftSearchWrap"] input:not([type="search"])') ||
       document.querySelector('input[placeholder*="搜索规则"]');
     if (tree && searchInput) {
       // 规则页：先搜索框过滤，再在结果里锁定业务线点击展开
-      const found = await searchAndExpandBizLine(tree, searchInput, refs, bizLine);
-      if (found) return;
+      const searchFound = await searchAndExpandBizLine(tree, searchInput, refs, bizLine);
+      if (searchFound) {
+        qcTrack('定位质检点', { result: 'success', qp: qpCode, biz: bizLine || '' });
+        return;
+      }
     } else if (tree) {
       // 无搜索框：树内已展开部分直搜
       for (const ref of refs) {
         const el = findQcPointEl(ref, tree);
-        if (el) { flashQcTarget(el, ref); return; }
+        if (el) { flashQcTarget(el, ref); qcTrack('定位质检点', { result: 'success', qp: qpCode, biz: bizLine || '' }); return; }
       }
     }
     // 通用页面（复核页差异表等）或规则页兜底
     for (const ref of refs) {
       const el = findQcPointEl(ref);
-      if (el) { flashQcTarget(el, ref); return; }
+      if (el) { flashQcTarget(el, ref); qcTrack('定位质检点', { result: 'success', qp: qpCode, biz: bizLine || '' }); return; }
     }
     showToast('⚠️ 页面上未找到质检点：' + refs.join(' / '));
+    qcTrack('定位质检点', { result: 'fail', qp: qpCode, biz: bizLine || '' });
   }
 
   // 滚动居中 + 高亮闪烁 + 点击目标（表格行/树内规则行尽量整行高亮）
@@ -1271,6 +1300,7 @@
   }
   function switchPanelMode(name) {
     if (panelMode === name) return;
+    const from = panelMode;
     panelMode = name;
     const modeBar = panelEl && panelEl.querySelector('#qc-mode-bar');
     if (modeBar) {
@@ -1331,9 +1361,13 @@
       try {
         const resp = await chrome.runtime.sendMessage({ type: 'qc-evalset', taskIds: ids });
         renderEvalsetResult(resp, result, status);
+        // ✅ 评测集生成成功埋点
+        qcTrack('评测集生成', { result: 'success', task_count: ids.split(/[,，;\s]+/).filter(Boolean).length });
       } catch (e) {
         status.style.color = '#c5221f';
         status.textContent = '发生异常：' + (e && e.message || e);
+        // ✅ 评测集生成失败埋点
+        qcTrack('评测集生成', { result: 'fail', task_count: ids.split(/[,，;\s]+/).filter(Boolean).length, error: String(e && e.message || e) });
       } finally {
         btn.disabled = false;
         btn.style.opacity = '1';
@@ -1525,7 +1559,15 @@
     // 注意：必须显式传 false。若直接传 refreshFormat，点击事件对象会被当成 silent=true，
     // 导致失败时静默（不弹 toast、不更新状态条）、成功时误显示「自动重新加载格式」，
     // 在预发环境（点击停止后页面气泡可能未渲染完整「## 优化结果」）下表现为「按钮点了没反应」。
-    refreshBtn.addEventListener('click', (e) => { e.preventDefault(); refreshFormat(false); });
+    refreshBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      const res = refreshFormat(false);
+      if (res === 'success') {
+        qcTrack('重载格式按钮', { result: 'success', biz: chatForm.biz, qp: chatForm.qp, problems_count: lastProblems.length });
+      } else {
+        qcTrack('重载格式按钮', { result: 'fail', biz: chatForm.biz, qp: chatForm.qp, reason: res });
+      }
+    });
     statusRow.appendChild(refreshBtn);
     box.appendChild(statusRow);
   
@@ -1553,6 +1595,20 @@
       const tasks = parseTaskIds(tasksRaw);
       // 新一轮开始：先清掉上一轮旧数据（格式化卡片 + RCA 残留），再重渲染，
       // 避免新旧两轮结果混在同一面板里（须在重渲染前清，否则刚重建的对话框会被丢弃）
+
+      // ── 记录当前链路类型（用于后续根据实际结果触发埋点）──
+      let trackEvent = '';
+      let trackParams = { biz, qp };
+      if (tasks.length) {
+        trackEvent = 'Task ID优化模式';
+        trackParams.task_count = tasks.length;
+      } else if (mode === 'dir' && dir && dir.length > 0) {
+        trackEvent = '指定优化方向模式';
+        trackParams.dir_length = dir.length;
+      } else {
+        trackEvent = '逻辑自检优化模式';
+      }
+
       lastProblems = [];
       lastExtracted = '';
       lastRcaText = '';
@@ -1587,6 +1643,8 @@
           if (boxNow) renderRcaBox(boxNow, rcaText, 'confirm');
           setChatStatus('⏳ ② RCA 已生成（120 秒后自动发送）：可点「编辑」修改并保存，或点「直接发送」', 'info');
           startRcaReviewCountdown();
+          // ✅ 提交成功埋点
+          qcTrack(trackEvent, Object.assign({ result: 'success' }, trackParams));
           // 后续优化发送由 sendOptimizeWithRca 驱动（按钮/倒计时触发），本轮 submit 到此结束
           return;
         }
@@ -1597,8 +1655,12 @@
         setChatStatus('⏳ 已发送，等待 Agent 输出结束…', 'info');
         const reply = await sendAgentPrompt(optPrompt, { newSession: true });
         formatAgentReply(reply, optPrompt);
+        // ✅ 提交成功埋点
+        qcTrack(trackEvent, Object.assign({ result: 'success' }, trackParams));
       } catch (err) {
         setChatStatus('❌ ' + String(err && err.message || err), 'err');
+        // ✅ 提交失败埋点
+        qcTrack(trackEvent, Object.assign({ result: 'fail' }, trackParams));
       } finally {
         // 重渲染后旧 send 按钮可能已不在 DOM，优先恢复新面板上的按钮
         const btnNow = (panelEl && panelEl.querySelector('.qc-chat-send')) || send;
@@ -1734,6 +1796,7 @@
         const v = ta.value.trim();
         if (v) lastRcaText = v; // 空内容不覆盖，保留上一版
         renderRcaBox(container, lastRcaText, 'confirm');
+        qcTrack('RCA编辑按钮-点击保存', { result: 'success', biz: chatForm.biz, qp: chatForm.qp });
       }));
       btnRow.appendChild(mkBtn('✖ 取消', '丢弃本次编辑，回到确认态', false, () => {
         renderRcaBox(container, lastRcaText, 'confirm');
@@ -1741,9 +1804,10 @@
     } else {
       btnRow.appendChild(mkBtn('✏️ 编辑', '修改 RCA 内容（保存后生效）', false, () => {
         renderRcaBox(container, lastRcaText, 'edit');
+        qcTrack('RCA编辑按钮-点击编辑', { result: 'success', biz: chatForm.biz, qp: chatForm.qp });
       }));
       btnRow.appendChild(mkBtn('🚀 直接发送', '以当前 RCA 立即发送优化请求', true, () => {
-        sendOptimizeWithRca();
+        sendOptimizeWithRca('manual');
       }));
     }
     container.appendChild(btnRow);
@@ -1760,7 +1824,7 @@
       const cdEl = panelEl && panelEl.querySelector('.qc-rca-countdown');
       if (cdEl) cdEl.textContent = '⏱ ' + remain + 's';
       if (remain <= 0) {
-        sendOptimizeWithRca(); // 倒计时结束：自动直接发送
+        sendOptimizeWithRca('auto'); // 倒计时结束：自动直接发送
         return;
       }
       setChatStatus('⏳ ② RCA 已生成，' + remain + ' 秒后自动发送：可点「编辑」修改并保存，或点「直接发送」', 'info');
@@ -1773,9 +1837,9 @@
   // 确认态发送优化请求（「直接发送」按钮/60 秒倒计时到期共用），
   // 以当前已保存的 RCA（lastRcaText）为准。
   // 注：本轮「直接发送」不清会话（newSession=false）——RCA 生成轮可能刚结束流式输出，
-  // handleDrive → waitForReady 已等 hook.js 自动关流、输入框恢复，直接在当前会话模拟人工粘贴发送即可；
+  // handleDrive → waitForReady 已点停止并等输入框恢复，直接在当前会话模拟人工粘贴发送即可；
   // 此处再清会话会触发删除/新建会话操作叠加 React 渲染，易引发页面崩溃。
-  function sendOptimizeWithRca() {
+  function sendOptimizeWithRca(triggerMode) {
     if (!rcaAwaitingReview) return; // 防重复触发（按钮 + 倒计时竞争）
     rcaAwaitingReview = false;
     stopRcaReviewCountdown();
@@ -1795,59 +1859,78 @@
         setChatStatus('⏳ ③ 已发送，等待 Agent 输出结束…', 'info');
         const reply = await sendAgentPrompt(optPrompt, { newSession: false });
         formatAgentReply(reply, optPrompt);
+        // ✅ 直接发送成功埋点
+        qcTrack('RCA直接发送', { result: 'success', biz: biz, qp: qp, trigger: triggerMode || 'unknown' });
       } catch (err) {
         setChatStatus('❌ ' + String(err && err.message || err), 'err');
+        // ✅ 直接发送失败埋点
+        qcTrack('RCA直接发送', { result: 'fail', biz: biz, qp: qp, trigger: triggerMode || 'unknown' });
       } finally {
         if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '发送'; }
       }
     })();
   }
   
-  // Agent 输出结束 → 自动执行格式化：与整页提取同一条管线，两条链路共用。
-  // ⓪ 预清洗：Agent 输出偶带零宽字符/全角符号/汉字间杂散空格（如「优化 结果」）/加粗符号
-  //    （如「**原文定位：**」），会打断标记与条目正则，先统一清掉；
-  // ① 再归一化（修复「###第 1条」「XXX- 修改条数」等粘连）；
-  // ② 对话回复是定向输出，长度下限放宽到 60（单条修改的合法回复常不足 500 字）；
-  // ③ 兕底：回复没带「## 优化结果」头但直接含「### 第 N 条」也能解析。
+  // Agent 输出结束 → 自动执行格式化。
+  // 改用 extractResult() 从页面 DOM 提取（与 refreshFormat 一致），比直接解析 Agent 回复文本更可靠。
   // promptCtx = 本轮发送的优化提示词（含业务线+质检点）→ 质检点/业务线识别的权威来源。
-  function formatAgentReply(reply, promptCtx) {
-    const scrubbed = reply
-      .replace(/[\u200b\u200c\u200d\ufeff\u00ad]/g, '')
+  function formatAgentReply(reply, promptCtx, skipTrack = false) {
+    // 优先走页面提取路径（与 refreshFormat 完全一致）
+    const result = extractResult();
+    if (result) {
+      const problems = structureProblems(result, promptCtx);
+      if (problems.length) {
+        lastExtracted = result;
+        lastProblems = problems;
+        setChatStatus('✅ 格式化完成', 'ok');
+        rerenderExtractBody();
+        scheduleAutoRefresh();
+        if (!skipTrack) {
+          qcTrack('格式化', { result: 'success', reply_len: reply ? reply.length : 0, problems_count: problems.length });
+        }
+        return true;
+      }
+    }
+
+    // 页面提取失败，退化到 Agent 回复文本解析
+    const scrubbed = (reply || '')
+      .replace(/[​‌‍﻿­]/g, '')
       .replace(/＃/g, '#')
-      .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+      .replace(/[0-9]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
       .replace(/\*\*([^*\n]+)\*\*/g, '$1')
       .replace(/(?<=[一-龥])[ \t]+(?=[一-龥])/g, '');
     const norm = normalizeExtractText(scrubbed);
-    // 用「最后一次」出现的「## 优化结果」标记切片（与整页提取同策略）：
-    // Agent 回复前的思考过程/复述可能也包含该字样，从第一次出现处切会把思考文字当正文
-    const markerIdx = lastMarkerIndex(norm);
+    const markerIdx = firstMarkerIndex(norm);
     const refined = markerIdx >= 0 ? sliceResultText(norm.slice(markerIdx), 60) : null;
     let problems = refined ? structureProblems(refined, promptCtx) : [];
     if (!problems.length) problems = structureProblems(norm, promptCtx);
+
     if (problems.length) {
       lastExtracted = refined || norm;
       lastProblems = problems;
       setChatStatus('✅ 格式化完成', 'ok');
       rerenderExtractBody();
-      // 5 秒后自动重载一次格式：捕获时 Agent 输出可能未加载全，
-      // 此时页面气泡通常已渲染完整回复；仍有问题由人工点「🔄 重载格式」兜底
       scheduleAutoRefresh();
+      if (!skipTrack) {
+        qcTrack('格式化', { result: 'success', reply_len: reply ? reply.length : 0, problems_count: problems.length });
+      }
       return true;
     }
-    // 格式化失败诊断：回复长度、标记/条目是否存在、开头内容，便于定位是哪一环失配
+
+    // 格式化失败诊断
     const hasMarker = MARKER_PATTERN.test(norm);
     const hasTitles = /#{1,6}\s*第\s*\d+\s*条/.test(norm);
-    // 从标记处开始的正文预览（无标记时用全文开头）：直接看出标记后到底接了什么
     const previewStart = markerIdx >= 0 ? markerIdx : 0;
-    console.warn('[QC 提取器] 对话回复格式化失败 | 长度:' + reply.length +
+    console.warn('[QC 提取器] 对话回复格式化失败 | 长度:' + (reply ? reply.length : 0) +
       ' | 含「## 优化结果」:' + hasMarker + ' | 含「第 N 条」:' + hasTitles +
       ' | 标记后正文预览:', norm.slice(previewStart, previewStart + 500));
-    // 区分两种「找不到可渲染的格式」：① 连「## 优化结果」标记都没有 → 格式完全不符；
-    // ② 有标记但无「第 N 条」条目（本轮多为「修改条数：0 条 / 无需修改」）→ 明确告知无可渲染条目。
-    setChatStatus(hasMarker
-      ? '⚠️ 已识别「## 优化结果」，但找不到可渲染的修改条目（本轮可能无需修改，回复 ' + reply.length + ' 字）'
-      : '⚠️ 找不到可渲染的格式（回复 ' + reply.length + ' 字，未见「## 优化结果」标记），详情见控制台',
-      'warn');
+
+    if (!skipTrack) {
+      qcTrack('格式化', { result: 'fail', reply_len: reply ? reply.length : 0, error_code: hasMarker ? 'no-titles' : 'no-marker' });
+    }
+    setChatStatus('⚠️ 无法格式化（回复 ' + (reply ? reply.length : 0) + ' 字' +
+      (hasMarker ? '' : '，未见「## 优化结果」标记') +
+      (hasTitles ? '' : '，未见「### 第 N 条」条目') + '），详情见控制台', 'warn');
     return false;
   }
   
@@ -1888,33 +1971,24 @@
       const result = extractResult();
       if (!result) {
         if (!silent) showToast('⚠️ 当前页面未检测到「## 优化结果」');
-        return;
+        return 'no_result';
       }
       const problems = structureProblems(result, lastUserBubbleText());
-      // 诊断（仅手动重载时打印）：对比「第N条」总出现次数与落到行首的次数——
-      // 若总数 > 行首数，说明有标题没被还原到行首（会被 structureProblems 漏掉、卡片缺失）。
-      if (!silent) {
-        const totalTitles = (result.match(/第\s*\d+\s*条/g) || []).length;
-        const lineStartTitles = (result.match(/^#{0,6}\s*第\s*\d+\s*条/gm) || []).length;
-        console.log('[QC 重载格式] 解析卡片:', problems.length,
-          '| 「第N条」总出现:', totalTitles, '| 行首「第N条」:', lineStartTitles,
-          '\n提取文本:\n' + result.slice(0, 2000));
-      }
       if (!problems.length) {
-        // 已提取到「## 优化结果」但无「第 N 条」条目：多为「修改条数：0 条 / 无需修改」，
-        // 明确告知找不到可渲染条目（而非含糊的「未解析出条目」）。
-        if (!silent) showToast('⚠️ 已提取「## 优化结果」，但找不到可渲染的修改条目（本轮可能无需修改）');
-        return;
+        if (!silent) showToast('⚠️ 提取到内容但未解析出条目，请等 Agent 输出结束后重试');
+        return 'no_problems';
       }
       // 静默路线：页面内容与上次一致说明没有新的完整回复，不动状态也不重渲染
-      if (silent && result === lastExtracted) return;
+      if (silent && result === lastExtracted) return 'unchanged';
       lastExtracted = result;
       lastProblems = problems;
       setChatStatus('✅ ' + (silent ? '自动' : '已') + '重新加载格式（' + problems.length + ' 条）', 'ok');
       rerenderExtractBody();
+      return 'success';
     } catch (err) {
       console.warn('[QC Panel] 重载格式失败:', err);
       if (!silent) showToast('❌ 重载格式失败：' + String(err && err.message || err));
+      return 'error';
     }
   }
 
@@ -2162,6 +2236,7 @@
 
   function extractAndShow() {
     userDismissed = false;
+    const t0 = Date.now();
     const result = extractResult();
     if (!result) {
       // 页面无「## 优化结果」时也打开面板，确保「质检点详情」模式始终可达（不再"打不开"）
@@ -2171,6 +2246,7 @@
     }
     if (result === lastExtracted && panelEl) return;
     createPanel(result);
+    qcTrack('feature/extract', { result: 'success', reply_len: result.length, duration_ms: Date.now() - t0 });
   }
 
   // ══════════════════════════════════════════
@@ -2268,3 +2344,4 @@
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();
+1
