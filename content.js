@@ -33,7 +33,7 @@
   let panelCollapsed = false;  // 侧边栏是否收起
   let chatStatus = '';         // 模式 A：Agent 对话状态提示（跨面板重渲染保留）
   let chatStatusCls = '';      // 状态提示样式类（ok/warn/err/info）
-  let chatForm = { biz: '', qp: '', tasks: '', dir: '', mode: 'tasks' }; // 对话框输入项回显（重渲染不丢已填内容；dir=优化方向；mode=优化类型下拉，默认 tasks）
+  let chatForm = { biz: '', qp: '', tasks: '', dir: '', mode: 'tasks', ver: 'release' }; // 对话框输入项回显（重渲染不丢已填内容；dir=优化方向；mode=优化类型下拉，默认 tasks；ver=规则版本单选，release=发布版本/draft=草稿版，默认 release）
   let lastRcaText = '';        // task id 链路第一步生成的 RCA 分析（面板内展示，重渲染保留）
   let rcaAwaitingReview = false; // RCA 已生成、等待用户确认发送优化请求（60 秒倒计时结束自动发送）
   let rcaReviewDeadline = 0;     // 确认倒计时截止时间戳（面板重渲染后恢复倒计时用）
@@ -1501,6 +1501,30 @@
     });
     modeSelect.value = chatForm.mode === 'dir' ? 'dir' : 'tasks';
 
+    // 规则版本单选（二选一，默认发布版本）：草稿版 → 发送时质检点后写「草稿版」；发布版本 → 写「正式版」
+    const verRow = document.createElement('div');
+    verRow.style.cssText = 'margin-bottom:8px';
+    const verLabel = mkLabel('规则版本');
+    verRow.appendChild(verLabel);
+    const verChoices = document.createElement('div');
+    verChoices.style.cssText = 'display:flex;gap:16px;align-items:center;padding:4px 2px';
+    [['release', '发布版本'], ['draft', '草稿版']].forEach((it) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;align-items:center;gap:4px;font-size:12px;color:#333;cursor:pointer;font-family:' + FONT;
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'qc-rule-version';
+      radio.value = it[0];
+      radio.checked = (chatForm.ver || 'release') === it[0];
+      radio.addEventListener('change', () => { if (radio.checked) chatForm.ver = it[0]; });
+      const txt = document.createElement('span');
+      txt.textContent = it[1];
+      wrap.appendChild(radio);
+      wrap.appendChild(txt);
+      verChoices.appendChild(wrap);
+    });
+    verRow.appendChild(verChoices);
+
     // Task ID 与优化方向统一为 textarea（rows=1 起始高度与单行输入框一致，行距统一；可向下拖拽变高）
     const taskInput = document.createElement('textarea');
     taskInput.placeholder = 'task id / 复核 id，可多个（逗号/空格分隔，选填）';
@@ -1528,6 +1552,7 @@
 
     box.appendChild(mkRow('业务线 *', bizInput));
     box.appendChild(mkRow('质检点 *', qpInput));
+    box.appendChild(verRow);
     box.appendChild(mkRow('优化类型', modeSelect));
     box.appendChild(taskRow);
     box.appendChild(dirRow);
@@ -1587,9 +1612,12 @@
       const qp = qpInput.value.trim();
       // 优化类型下拉二选一：仅当前模式的输入生效（默认 Task ID），另一项不参与发送
       const mode = modeSelect.value === 'dir' ? 'dir' : 'tasks';
+      const ver = chatForm.ver === 'draft' ? 'draft' : 'release';
+      // 规则版本标记：草稿版 → 「（草稿版）」，发布版本 → 「（正式版）」，追加在质检点取值之后
+      const verTag = ver === 'draft' ? '（草稿版）' : '（正式版）';
       const tasksRaw = mode === 'tasks' ? taskInput.value.trim() : '';
       const dir = mode === 'dir' ? dirInput.value.trim() : '';
-      chatForm = { biz, qp, tasks: tasksRaw, dir, mode }; // 回显持久化，重渲染不丢已填内容
+      chatForm = { biz, qp, tasks: tasksRaw, dir, mode, ver }; // 回显持久化，重渲染不丢已填内容
       if (!biz || !qp) { setChatStatus('⚠️ 业务线与质检点为必填项', 'warn'); return; }
       if (send.disabled) return;
       const tasks = parseTaskIds(tasksRaw);
@@ -1632,7 +1660,7 @@
           // 链路②第一步：生成 RCA（后台自动清会话后发送，返回的即气泡中的 RCA 分析）
           setChatStatus('⏳ ① 正在生成 RCA 分析（' + tasks.length + ' 个 task id）…', 'info');
           const rcaPrompt = '请对以下复核任务进行根因分析（RCA）。\n业务线：' + biz +
-            '\n质检点：' + qp + '\ntask id（复核 id）：' + tasks.join('、');
+            '\n质检点：' + qp + verTag + '\ntask id（复核 id）：' + tasks.join('、');
           rcaText = await sendAgentPrompt(rcaPrompt, { newSession: true });
           lastRcaText = rcaText;
           // 进入确认态：只读展示 + 60 秒倒计时，可点「编辑」修改（保存/取消），
@@ -1650,7 +1678,7 @@
         }
         // 无 task id 链路：直接发优化提示词并格式化（旧 RCA 残留已在上面统一清除）
         // 填了优化方向时追加独立一行「优化方向：…」
-        const optPrompt = '帮我优化\n业务线（keyword）： ' + biz + '\n质检点（rule_code）： ' + qp +
+        const optPrompt = '帮我优化\n业务线（keyword）： ' + biz + '\n质检点（rule_code）： ' + qp + verTag +
           (dir ? '\n优化方向：' + dir : '');
         setChatStatus('⏳ 已发送，等待 Agent 输出结束…', 'info');
         const reply = await sendAgentPrompt(optPrompt, { newSession: true });
@@ -1845,6 +1873,7 @@
     stopRcaReviewCountdown();
     const rcaFinal = String(lastRcaText || '').trim();
     const biz = chatForm.biz, qp = chatForm.qp;
+    const verTag = chatForm.ver === 'draft' ? '（草稿版）' : '（正式版）'; // 规则版本标记（与 submit 提交时一致）
     const dir = String(chatForm.dir || '').trim(); // 优化方向（选填）
     (async () => {
       const sendBtn = panelEl && panelEl.querySelector('.qc-chat-send');
@@ -1853,7 +1882,7 @@
         // RCA 区切回只读展示（去掉倒计时与按钮，以最终发送的内容为准）
         const rcaBoxEl = panelEl && panelEl.querySelector('.qc-rca-box');
         if (rcaBoxEl && rcaFinal) renderRcaBox(rcaBoxEl, rcaFinal, 'plain');
-        const optPrompt = '帮我优化质检点\n业务线（keyword）：' + biz + '\n质检点（rule_code）：' + qp +
+        const optPrompt = '帮我优化质检点\n业务线（keyword）：' + biz + '\n质检点（rule_code）：' + qp + verTag +
           (dir ? '\n优化方向：' + dir : '') +
           (rcaFinal ? '\n' + rcaFinal : '');
         setChatStatus('⏳ ③ 已发送，等待 Agent 输出结束…', 'info');
