@@ -2239,7 +2239,7 @@
     colO.className = 'qc-cmp-col';
     const lblO = document.createElement('div');
     lblO.className = 'qc-cmp-label';
-    lblO.textContent = '📄 规则原文（只读，橙色=已被修改的位置）';
+    lblO.textContent = '📄 规则原文（只读）';
     const stackO = document.createElement('div');
     stackO.className = 'qc-cmp-stack';
     cmp.origMirror = document.createElement('div');
@@ -2281,7 +2281,7 @@
     colM.className = 'qc-cmp-col';
     const lblM = document.createElement('div');
     lblM.className = 'qc-cmp-label';
-    lblM.textContent = '✏️ 修改后（黄色=替换内容，只读·点「编辑」修改）';
+    lblM.textContent = '✏️ 修改后（点「编辑」修改）';
     cmp.modLbl = lblM; // 编辑态切换时更新列头提示
     const stack = document.createElement('div');
     stack.className = 'qc-cmp-stack';
