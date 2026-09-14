@@ -3505,7 +3505,7 @@
     const title = document.createElement('span');
     title.id = 'qc-panel-title';
     title.style.cssText = 'font-weight:700;font-size:15px;color:#fff;flex:1';
-    title.textContent = '🤖 质检助手 v5.4.8'; // 版本号入 UI：重载插件后打开面板即可肉眼确认新旧代码
+    title.textContent = '🤖 质检助手'; // 版本号入 UI：重载插件后打开面板即可肉眼确认新旧代码
 
     const actions = document.createElement('div');
     actions.id = 'qc-panel-actions';
