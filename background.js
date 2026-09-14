@@ -123,6 +123,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (err) { sendResponse({ ok: false, error: String(err && err.message || err) }); }
       return;
     }
+    if (msg.type === 'qc-fetch-rule-original') {
+      // 原文对比：按 质检点+业务线+版本状态 抓取质检规则原文
+      try {
+        sendResponse(await handleFetchRuleOriginal(msg, srcUrl));
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err && err.message || err) });
+      }
+      return;
+    }
     if (msg.type === 'qc-rca-agent') {
       const t0 = Date.now();
       try {
@@ -342,6 +351,222 @@ async function readVersionCache(tabId, qid) {
     args: [qid]
   });
   return res && res[0] && res[0].result ? res[0].result : null;
+}
+
+// ══════════════════════════════════════════
+// 原文对比：按 质检点 + 业务线 + 版本状态 获取质检规则原文
+//   ver=latest  → queryRuleByPage 缓存中的当前最新版本（含草稿）
+//   ver=release → 先用 queryRuleByPage 匹配到规则与 qcRuleId，
+//                 再走 getRuleVersionHistory 取历史发布版本中最新一版
+// ══════════════════════════════════════════
+function qcNorm(s) { return String(s == null ? '' : s).toUpperCase().replace(/[\s\-–—/_ ]/g, ''); }
+function qcEscRe(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// 质检点编码解析（与 content.js parseQcCode 同口径）：G17 / G017 / CO01 → { prefix, digits }
+function qcParseCode(raw) {
+  const s = String(raw || '').toUpperCase().replace(/[\s\-—–_:：]/g, '');
+  const m = s.match(/^([A-Z]{1,3}?)0*(\d{1,4})[A-Z]*$/);
+  if (!m || !m[1]) return null;
+  const digits = (m[2] || '').replace(/^0+(?=\d)/, '');
+  if (!digits) return null;
+  return { prefix: m[1], digits, core: m[1] + digits };
+}
+
+// 对象自身属性里的字符串/数字值（不深入嵌套，供打分与正文提取）
+function qcShallowStrings(obj) {
+  const out = [];
+  try {
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (typeof v === 'string' && v) out.push(v);
+      else if (typeof v === 'number') out.push(String(v));
+    }
+  } catch (e) { /* 忽略 */ }
+  return out;
+}
+
+// 深度搜索节点内最长的字符串（规则正文通常在嵌套字段里）
+function qcDeepLongest(node) {
+  let best = '';
+  const visit = (n, d) => {
+    if (!n || typeof n !== 'object' || d > 6) return;
+    if (Array.isArray(n)) { n.forEach(x => visit(x, d + 1)); return; }
+    for (const k of Object.keys(n)) {
+      const v = n[k];
+      if (typeof v === 'string') { if (v.length > best.length) best = v; }
+      else if (v && typeof v === 'object') visit(v, d + 1);
+    }
+  };
+  visit(node, 0);
+  return best;
+}
+
+// 在 queryRuleByPage 合并缓存（多份响应 payload）里找出目标规则对象：
+// 递归遍历，按「含质检点编码 +10 / 含业务线 +6」打分，同分取最长正文者
+function qcFindRule(dataArr, code, bizName) {
+  const re = (code && code.prefix)
+    ? new RegExp('(?<![A-Za-z])' + code.prefix.toUpperCase().split('').map(qcEscRe).join('\\s*[-—–]?\\s*') +
+        '\\s*[-—–]?\\s*0*' + code.digits + '(?![0-9])', 'i')
+    : new RegExp('(?<![A-Za-z0-9])' + qcEscRe(String(code)) + '(?![A-Za-z0-9])', 'i');
+  const nb = bizName ? qcNorm(bizName) : '';
+  const cands = [];
+  const visit = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 9) return;
+    if (Array.isArray(node)) { node.forEach(n => visit(n, depth + 1)); return; }
+    const strs = qcShallowStrings(node);
+    if (strs.length) {
+      const joined = strs.join('\n');
+      let score = 0;
+      if (re.test(joined)) score += 10;
+      if (nb && qcNorm(joined).indexOf(nb) !== -1) score += 6;
+      if (score > 0) {
+        let longest = '';
+        for (const s of strs) if (s.length > longest.length) longest = s;
+        cands.push({ obj: node, score, longest });
+      }
+    }
+    for (const k of Object.keys(node)) {
+      try { visit(node[k], depth + 1); } catch (e) { /* 循环引用防御 */ }
+    }
+  };
+  (Array.isArray(dataArr) ? dataArr : [dataArr]).forEach(p => visit(p, 0));
+  if (!cands.length) return null;
+  cands.sort((a, b) => (b.score - a.score) || (b.longest.length - a.longest.length));
+  const best = cands[0];
+  // qcRuleId：优先 ruleId 类字段，其次纯数字 id 字段（getRuleVersionHistory 入参）
+  let ruleId = '';
+  try {
+    for (const k of Object.keys(best.obj)) {
+      if (/qcruleid|ruleid/i.test(k)) {
+        const v = best.obj[k];
+        if (v != null && String(v).trim()) { ruleId = String(v).trim(); break; }
+      }
+    }
+    if (!ruleId) {
+      for (const k of Object.keys(best.obj)) {
+        if (/^(id)$/i.test(k)) {
+          const v = best.obj[k];
+          if (v != null && /^\d+$/.test(String(v).trim())) { ruleId = String(v).trim(); break; }
+        }
+      }
+    }
+  } catch (e) { /* 忽略 */ }
+  // 标题（可选）
+  let title = '';
+  try {
+    for (const k of ['title', 'name', 'ruleCode', 'qcRuleCode', 'ruleName']) {
+      const v = best.obj[k];
+      if (typeof v === 'string' && v && v.length < 100) { title = v; break; }
+    }
+  } catch (e) { /* 忽略 */ }
+  // 正文：优先含质检点编码的长字段，其次最长字段，最后深度搜索
+  let content = '';
+  try {
+    const strs = qcShallowStrings(best.obj).filter(s => s.length >= 80);
+    const hitStr = strs.find(s => re.test(s));
+    content = hitStr || (strs.length ? strs.reduce((a, b) => (b.length > a.length ? b : a)) : '');
+    if (content.length < 60) {
+      const deep = qcDeepLongest(best.obj);
+      if (deep.length > content.length) content = deep;
+    }
+  } catch (e) { /* 忽略 */ }
+  return { content, ruleId, title, score: best.score };
+}
+
+// 从 getRuleVersionHistory 响应中挑最新一版：
+// 优先时间字段(gmtModified/gmtCreate等)，其次版本号字段，最后取数组末项
+function qcPickLatestVersion(vhData) {
+  let bestArr = null;
+  const visit = (node, depth) => {
+    if (!node || typeof node !== 'object' || depth > 7) return;
+    if (Array.isArray(node)) {
+      const objs = node.filter(x => x && typeof x === 'object' && !Array.isArray(x));
+      if (objs.length && (!bestArr || objs.length > bestArr.length)) bestArr = objs;
+      node.forEach(n => visit(n, depth + 1));
+      return;
+    }
+    for (const k of Object.keys(node)) { try { visit(node[k], depth + 1); } catch (e) { /* */ } }
+  };
+  visit(vhData, 0);
+  if (!bestArr || !bestArr.length) return null;
+  const tsOf = (item) => {
+    for (const k of Object.keys(item)) {
+      if (/gmtmodified|gmtcreate|modifiedtime|createtime|updatetime|publishtime/i.test(k)) {
+        const v = item[k];
+        if (v == null) continue;
+        const s = String(v).trim();
+        if (/^\d+$/.test(s)) return parseInt(s, 10);
+        const t = Date.parse(s);
+        if (!isNaN(t)) return t;
+      }
+    }
+    return null;
+  };
+  const verOf = (item) => {
+    for (const k of Object.keys(item)) {
+      if (/version/i.test(k)) {
+        const n = parseFloat(String(item[k]).replace(/[^\d.]/g, ''));
+        if (!isNaN(n)) return n;
+      }
+    }
+    return null;
+  };
+  let pick = null, pickKey = -Infinity;
+  bestArr.forEach((item, i) => {
+    const ts = tsOf(item);
+    const ver = verOf(item);
+    const key = ts != null ? ts : (ver != null ? ver : i);
+    if (key >= pickKey) { pickKey = key; pick = item; }
+  });
+  if (!pick) return null;
+  const content = qcDeepLongest(pick);
+  let label = '';
+  for (const k of Object.keys(pick)) {
+    if (/version|gmtmodified|gmtcreate/i.test(k) && pick[k] != null && String(pick[k]).length < 40) {
+      label = k + ':' + pick[k];
+      break;
+    }
+  }
+  return { content, label };
+}
+
+async function handleFetchRuleOriginal(msg, sourceUrl) {
+  const qp = String((msg && msg.qp) || '').trim();
+  const biz = String((msg && msg.biz) || '').trim();
+  const ver = (msg && msg.ver) === 'latest' ? 'latest' : 'release';
+  if (!qp) return { ok: false, error: 'no-qp', hint: '请先填写质检点编码' };
+  const tab = await getRuleTab(sourceUrl);
+  // queryRuleByPage 真实响应缓存（无缓存时会 reload 规则页触发请求，首次较慢）
+  const cache = await ensureCache(tab.id);
+  if (!cache) {
+    return { ok: false, error: 'no-rule-cache', hint: '未能捕获 queryRuleByPage 响应：请确认规则管理页可正常加载后重试' };
+  }
+  const hit = qcFindRule(cache, qcParseCode(qp) || qp, biz);
+  if (!hit || !hit.content) {
+    return { ok: false, error: 'rule-not-found',
+      hint: '接口数据中未匹配到质检点「' + qp + '」' + (biz ? '（业务线：' + biz + '）' : '') +
+        '：请确认页面已加载该业务线的规则列表后重试' };
+  }
+  let original = hit.content;
+  let via = 'queryRuleByPage（当前最新版本）';
+  let note = '';
+  if (ver === 'release' && hit.ruleId) {
+    const vh = await handleQueryVersionHistory(hit.ruleId, sourceUrl);
+    if (vh && vh.ok) {
+      const pk = qcPickLatestVersion(vh.data);
+      if (pk && pk.content && pk.content.length >= 40) {
+        original = pk.content;
+        via = 'getRuleVersionHistory（历史发布版本' + (pk.label ? ' · ' + pk.label : '') + '）';
+      } else {
+        note = '历史版本数据中未解析出规则正文，已使用当前最新版本';
+      }
+    } else {
+      note = '历史版本接口未取到（' + String((vh && vh.error) || 'unknown') + '），已使用当前最新版本';
+    }
+  } else if (ver === 'release' && !hit.ruleId) {
+    note = '未解析到规则 ID，无法查询历史发布版本，已使用当前最新版本';
+  }
+  return { ok: true, original, ruleId: hit.ruleId || '', title: hit.title || '', via, note, qcPoint: qp, biz };
 }
 
 // ══════════════════════════════════════════
