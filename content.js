@@ -3043,7 +3043,7 @@
     if (cmp.btnCancel) cmp.btnCancel.style.display = cmpEditMode ? '' : 'none';
     if (cmp.modLbl) cmp.modLbl.textContent = cmpEditMode
       ? '✏️ 修改后（编辑中：保存后生效，「取消」回滚）'
-      : '✏️ 修改后（黄色=替换内容，只读·点「编辑」修改）';
+      : '✏️ 修改后（点「编辑」修改）';
   }
 
   function cmpSaveEdit() {
