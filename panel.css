@@ -674,3 +674,252 @@ pre.qc-rca-debug-pre { white-space: pre-wrap; word-break: break-all; font-size: 
 .qc-chat-status.ok { color: #188038; }
 .qc-chat-status.warn { color: #b26a00; }
 .qc-chat-status.err { color: #c5221f; }
+
+/* ══════════════════════════════════════════════════
+   原文对比（左侧扩展区）：原文(只读) vs 修改后(可编辑+差异高亮)
+   ══════════════════════════════════════════════════ */
+/* 面板主列：对比区展开时与左侧对比区并排 */
+#qc-main-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
+
+/* 左缘扩展箭头（垂直文字，凸出面板左边缘） */
+#qc-compare-tab {
+  position: absolute;
+  left: -30px;
+  top: 50%;
+  transform: translateY(-50%);
+  writing-mode: vertical-rl;
+  letter-spacing: 3px;
+  padding: 14px 8px;
+  background: linear-gradient(180deg, #1a73e8, #1557b0);
+  color: #fff;
+  border: none;
+  border-radius: 8px 0 0 8px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: system-ui, sans-serif;
+  box-shadow: -2px 0 8px rgba(0, 0, 0, 0.18);
+  z-index: 2;
+  white-space: nowrap;
+}
+#qc-compare-tab:hover { filter: brightness(1.1); }
+
+/* 对比区容器：绝对定位挂在面板左缘向外扩展（不占面板布局空间，插件宽度不变） */
+#qc-compare-wrap {
+  display: none;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 100%;
+  width: min(860px, 56vw);
+  flex-direction: column;
+  min-height: 0;
+  background: #f8fafd;
+  border: 1px solid #d8dee8;
+  border-right: none;
+  border-radius: 10px 0 0 10px;
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.18);
+  z-index: 1;
+}
+
+/* 头部筛选条 */
+.qc-cmp-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 6px;
+  border-bottom: 1px solid #e2e8f2;
+  flex-shrink: 0;
+}
+.qc-cmp-field-label { font-size: 12px; font-weight: 600; color: #455a75; flex-shrink: 0; }
+.qc-cmp-input {
+  width: 108px;
+  padding: 5px 8px;
+  border: 1px solid #d0d7e2;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: system-ui, sans-serif;
+  background: #fff;
+  box-sizing: border-box;
+}
+.qc-cmp-input:focus { outline: none; border-color: #1a73e8; }
+.qc-cmp-fetch {
+  padding: 5px 12px;
+  border: none;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #1a73e8, #1557b0);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.qc-cmp-fetch:hover { filter: brightness(1.08); }
+.qc-cmp-fetch:disabled { opacity: 0.6; cursor: wait; }
+.qc-cmp-status {
+  flex-basis: 100%;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: #5f6368;
+}
+.qc-cmp-status.info { color: #1a73e8; }
+.qc-cmp-status.ok { color: #188038; }
+.qc-cmp-status.err { color: #c5221f; }
+
+/* 双列布局 */
+.qc-cmp-cols {
+  display: flex;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  padding: 0 10px 10px;
+}
+.qc-cmp-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.qc-cmp-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #455a75;
+  padding: 8px 2px 6px;
+  flex-shrink: 0;
+}
+
+/* 原文列与修改后列共用叠放结构（.qc-cmp-stack > .qc-cmp-mirror + .qc-cmp-hl + .qc-cmp-mod），
+   原文 textarea 额外只读 */
+/* 高亮覆盖层：Range 量测标记的真实渲染矩形后绝对定位绘制（不参与文本流，
+   镜像层纯文本与 textarea 折行完全一致 → 高亮永不漂移） */
+.qc-cmp-hl {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;          /* 程序化 scrollTop 与 textarea 同步滚动 */
+  pointer-events: none;
+  z-index: 1;
+}
+.qc-cmp-hl i {
+  position: absolute;
+  display: block;
+  background: #e9f7ee;       /* 修改后列：替换进来的内容，与卡片「修改方式」绿框同色 */
+  border-radius: 2px;
+}
+.qc-hl-orig i { background: #d1e2fa; } /* 原文列：被替换掉的原文区间，与卡片「原文定位」蓝框同色 */
+.qc-cmp-mod[readonly]::selection { background: rgba(255, 171, 64, 0.55); }
+
+/* 修改后：镜像层 + 透明文字 textarea 叠放（textarea 置顶可编辑，mirror 画 <mark> 高亮） */
+.qc-cmp-stack {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.qc-cmp-mirror,
+.qc-cmp-mod {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #d0d7e2;
+  border-radius: 8px;
+  font-family: "SF Mono", "Fira Code", Consolas, "Courier New", monospace;
+  font-size: 12.5px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  /* 对齐 textarea 的 UA 默认换行策略（UA 对 textarea 内置 overflow-wrap:break-word，
+     div 默认 normal）——两侧换行策略必须完全一致，否则镜像层每行容字数出现分歧，
+     高亮随文档位置累积漂移（首段准、越往下越偏） */
+  overflow-wrap: break-word;
+}
+/* 镜像层与 textarea 滚动条占位一致（宽度相同），保证换行/滚动位置对齐 */
+.qc-cmp-mirror,
+.qc-cmp-mod { overflow-y: scroll; overflow-x: hidden; }
+.qc-cmp-mirror::-webkit-scrollbar,
+.qc-cmp-mod::-webkit-scrollbar { width: 14px; }
+.qc-cmp-mirror::-webkit-scrollbar-thumb { background: transparent; }
+.qc-cmp-mod::-webkit-scrollbar-thumb { background: #c4c7cc; border-radius: 4px; }
+
+.qc-cmp-mirror {
+  background: #fff;
+  color: transparent;          /* 文字由上层 textarea 显示 */
+  pointer-events: none;
+  z-index: 1;
+}
+.qc-cmp-mirror mark {
+  background: #9ce2b5;          /* 与卡片「修改方式」绿框同色（遗留规则，镜像层现已用 <i> 绝对定位） */
+  color: transparent;          /* 只画底色，文字仍在 textarea 层 */
+  border-radius: 2px;
+  padding: 0;
+}
+.qc-cmp-mod {
+  background: transparent;
+  color: #222;
+  caret-color: #111;
+  resize: none;
+  z-index: 2;
+}
+.qc-cmp-mod:focus { outline: none; }
+.qc-cmp-mod::selection { background: rgba(255, 152, 0, 0.5); }
+
+/* 小屏：对比区占满更宽比例 */
+@media (max-width: 900px) {
+  #qc-compare-wrap { width: min(620px, 66vw); }
+}
+
+/* 「修改后」工具条：一键复制 / 编辑(→保存·取消) / 格式优化 */
+.qc-cmp-tools {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0;
+}
+.qc-cmp-tool-btn {
+  padding: 3px 10px;
+  background: #fff;
+  color: #1a73e8;
+  border: 1px solid #c9d6ea;
+  border-radius: 12px;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.qc-cmp-tool-btn:hover { background: #e8f0fe; border-color: #1a73e8; }
+.qc-cmp-tool-btn:active { transform: scale(0.95); }
+.qc-cmp-tool-edit { color: #e65100; border-color: #f0c9a8; }
+.qc-cmp-tool-edit:hover { background: #fff3e0; border-color: #e65100; }
+.qc-cmp-tool-fmt { color: #6a1b9a; border-color: #ddbeea; }
+.qc-cmp-tool-fmt:hover { background: #f3e5f5; border-color: #6a1b9a; }
+/* 编辑态的 保存/取消：配色与卡片「修改方式」就地编辑一致 */
+.qc-cmp-tool-save, .qc-cmp-tool-cancel {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11.5px;
+  cursor: pointer;
+  font-family: inherit;
+  white-space: nowrap;
+  transition: all 0.15s;
+  border: 1px solid transparent;
+}
+.qc-cmp-tool-save { background: #43a047; color: #fff; }
+.qc-cmp-tool-save:hover { background: #2e7d32; }
+.qc-cmp-tool-cancel { background: #fff; color: #5f6368; border-color: #d0d5dc; }
+.qc-cmp-tool-cancel:hover { background: #f1f3f4; }
