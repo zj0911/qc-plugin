@@ -1,6 +1,6 @@
 (function () {
   'use strict';
-  console.log('[QC Panel] v4.18.0 content.js loaded');
+  console.log('[QC Panel] v5.4.8-keephl content.js loaded');
 
   // 仅允许在质检平台域名下运行（双击/工具栏可能在非目标网页就地注入 content.js）。
   // 非目标域名直接退出，不创建悬浮按钮、不启动 4 秒自愈、不注册任何监听，避免与域名限制冲突。
@@ -39,6 +39,24 @@
   let rcaReviewDeadline = 0;     // 确认倒计时截止时间戳（面板重渲染后恢复倒计时用）
   let panelMode = 'A';            // 面板模式：A=对话优化 | C=评测集生成
   let evalsetForm = { taskIds: '' }; // 评测集模式输入回显（重渲染不丢已填内容）
+  // ── 原文对比（左侧扩展区）状态 ──
+  let compareOpen = false;        // 对比区是否展开
+  const cmp = {                   // 对比区 DOM/数据引用（面板重建后由 buildCompareWrap 重新填充）
+    wrap: null, origTa: null, modTa: null, mirror: null, origMirror: null,
+    hl: null, origHl: null,       // 高亮覆盖层（Range 量测矩形绝对定位，不参与文本流）
+    status: null, fetchBtn: null,
+    qpInput: null, bizSel: null, verSel: null,
+    original: '',                 // 已获取的规则原文
+    autoKey: '',                  // 已成功获取过的条件（自动获取去重，避免重复请求）
+    mergedMarks: [],              // 修改后文本中「被替换进来的修改方式」区间 [{start,end,p}]
+    origMarks: [],                // 原文文本中被替换掉的区间 [{start,end,p}]
+    lastMerged: '',               // 最近一次合并产出的文本（判断用户是否手动改过修改后）
+    lastModText: '',              // 标记对应的修改后文本快照（编辑增量平移的基准）
+    repaintTimer: null, syncLock: false
+  };
+  // 「修改后」工具条状态：一键复制 / 编辑(→保存·取消) / 格式优化
+  let cmpEditMode = false;   // 修改后是否处于编辑态（默认只读，点「编辑」解锁）
+  let cmpEditBackup = null;  // 进入编辑前快照 {text, mergedMarks, lastMerged, lastModText}，取消时回滚
 
   // 标记兼容 1~4 级标题：Agent 输出偶尔用「# 优化结果」单井号变体
   const MARKER_PATTERN = /#{1,4}\s*优化结果/;
@@ -1013,6 +1031,7 @@
       e.stopPropagation();
       const v = ta.value.trim();
       if (v) p.fix = v;
+      cmpSyncFixChange(); // 修改后文本 = 原文+修改方式 的合并产物，重算合并即同步
       close();
       showToast('✅ 修改方式已更新');
       qcTrack('优化规则编辑', { result: 'success', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
@@ -1040,8 +1059,10 @@
         let located = false;
         if (enc) {
           try {
-            highlightOnPage(decodeURIComponent(enc));
-            located = true;
+            // 仅定位到插件左侧对比区的「原文」textarea（选中+滚动+高亮），
+            // 不再做页面高亮；对比区收起时自动展开让结果可见
+            if (cmp.origTa && cmp.origTa.value && !compareOpen) setCompareOpen(true);
+            located = locateInCompare(decodeURIComponent(enc), p);
           } catch (e) { /* 定位失败 */ }
         }
         qcTrack('原文定位', { result: located ? 'success' : 'fail', duration_ms: Date.now() - t0, biz, qp });
@@ -1244,6 +1265,8 @@
     const closeBtn = panel.querySelector('.qc-close-btn');
     const hint = panel.querySelector('#qc-panel-hint');
     const modeBar = panel.querySelector('#qc-mode-bar');
+    const cmpWrap = panel.querySelector('#qc-compare-wrap');
+    const cmpTab = panel.querySelector('#qc-compare-tab');
     if (collapsed) {
       panel.style.width = '56px';
       if (body) body.style.display = 'none';
@@ -1251,6 +1274,8 @@
       if (closeBtn) closeBtn.style.display = 'none';
       if (hint) hint.style.display = 'none';
       if (modeBar) modeBar.style.display = 'none';
+      if (cmpWrap) cmpWrap.style.display = 'none'; // 收起侧栏时一并隐藏对比区（展开状态保留，展开侧栏后恢复）
+      if (cmpTab) cmpTab.style.display = 'none';
       if (actions) actions.style.display = 'flex';
       if (collapseBtn) {
         collapseBtn.style.display = 'block';
@@ -1265,6 +1290,8 @@
       if (closeBtn) closeBtn.style.display = '';
       if (hint) hint.style.display = '';
       if (modeBar) modeBar.style.display = 'flex';
+      if (cmpWrap) cmpWrap.style.display = compareOpen ? 'flex' : 'none';
+      if (cmpTab) cmpTab.style.display = '';
       if (actions) actions.style.display = 'flex';
       if (collapseBtn) {
         collapseBtn.style.margin = '';
@@ -1275,9 +1302,18 @@
   }
 
   // 模式 A：顶部 Agent 对话输入 + 下方问题卡片列表
+  // 卡片挂在独立容器 #qc-card-list 上，供「修改后 textarea 编辑同步」局部刷新（不重建对话框）
   function renderExtractBody(body) {
     body.innerHTML = '';
     body.appendChild(buildChatBox());
+    const list = document.createElement('div');
+    list.id = 'qc-card-list';
+    body.appendChild(list);
+    renderCardsInto(list);
+  }
+
+  function renderCardsInto(list) {
+    list.innerHTML = '';
     const problems = lastProblems;
     if (problems.length === 0) {
       const empty = document.createElement('div');
@@ -1285,11 +1321,18 @@
       empty.textContent = chatStatus
         ? '' // 对话进行中/刚完成时不再显示占位提示
         : '未解析到问题条目，请在上方输入提示词，或确认当前页面包含「### 第 N 条」的质检结果。';
-      if (empty.textContent) body.appendChild(empty);
+      if (empty.textContent) list.appendChild(empty);
     } else {
-      problems.forEach((p, i) => body.appendChild(buildCard(p, i)));
-      bindLocateButtons(body);
+      problems.forEach((p, i) => list.appendChild(buildCard(p, i)));
+      bindLocateButtons(list);
     }
+  }
+
+  // 仅刷新卡片列表（对比区编辑同步用）：不动对话框/状态条，避免抢焦点
+  function rerenderCardsOnly() {
+    if (!panelEl) return;
+    const list = panelEl.querySelector('#qc-card-list');
+    if (list) renderCardsInto(list);
   }
 
   // ── 模式分派：A 对话优化 / C 评测集生成 ──
@@ -1641,6 +1684,7 @@
       lastExtracted = '';
       lastRcaText = '';
       rcaReviewDeadline = 0;
+      cmpResetContent(); // 新一轮开始：清空对比区（上一轮原文/修改后不串场）
       // 取消上一轮遗留的自动刷新定时器，避免新一轮等待期间拿旧内容重渲染
       if (autoRefreshTimer) { clearTimeout(autoRefreshTimer); autoRefreshTimer = null; }
       // 先停计时器再清标志，避免旧倒计时 tick 在间隙里误触发上一轮的自动发送
@@ -1979,6 +2023,12 @@
     if (!panelEl) return;
     const body = panelEl.querySelector('#qc-panel-body');
     if (body) renderExtractBody(body);
+    if (compareOpen) cmpRefreshFromState(); // 对比区展开时同步最新格式化内容到「修改后」
+    // 格式化结果就绪后自动带参（对话框填写的质检点/业务线/版本状态）获取规则原文，
+    // 对比区收起时也会预取，展开即可直接看到原文，无需用户重复填写
+    if (lastExtracted && lastProblems.length && panelEl.querySelector('#qc-compare-wrap')) {
+      cmpAutoFetch();
+    }
   }
 
   // 重载格式：Agent 输出有时未加载全导致格式化不完整（卡片缺失/字段不全），
@@ -2062,6 +2112,1359 @@
   }
 
 
+  // ══════════════════════════════════════════
+  // 5.5 原文对比（左侧扩展区）
+  //   左列：规则原文（只读，页面接口抓取）｜右列：修改后（默认只读，「编辑」解锁，与原文差异高亮）
+  //   原文滚动 → 修改后按比例同步滚动；卡片「定位原文」在两个 textarea 内选中定位；
+  //   修改后编辑 → 防抖重解析同步到卡片；卡片修改方式编辑 → 反向同步进 textarea
+  // ══════════════════════════════════════════
+
+  // 「修改后」列工具条：一键复制 / 编辑(→保存·取消) / 格式优化
+  // 编辑交互参照卡片「修改方式」就地编辑（openFixEditor）：编辑时隐藏其余按钮，只留 保存/取消
+  // 面板重建会重新调用 → 在此复位编辑态，避免旧态残留把新 textarea 锁死
+  function buildModToolbar() {
+    cmpEditMode = false;
+    cmpEditBackup = null;
+    const bar = document.createElement('div');
+    bar.className = 'qc-cmp-tools';
+    const mkBtn = (label, title, cls) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = cls;
+      b.textContent = label;
+      b.title = title;
+      return b;
+    };
+    cmp.btnCopy = mkBtn('📋 一键复制', '复制「修改后」全文', 'qc-cmp-tool-btn');
+    cmp.btnCopy.addEventListener('click', () => {
+      const v = cmp.modTa ? cmp.modTa.value : '';
+      if (!v) { showToast('⚠️ 修改后暂无内容'); return; }
+      navigator.clipboard.writeText(v).then(() => {
+        cmp.btnCopy.textContent = '✅ 已复制';
+        setTimeout(() => { if (cmp.btnCopy) cmp.btnCopy.textContent = '📋 一键复制'; }, 1500);
+        qcTrack('对比区复制', { result: 'success', len: v.length });
+      }).catch(() => { showToast('❌ 复制失败'); qcTrack('对比区复制', { result: 'fail', error_code: 'clipboard' }); });
+    });
+    cmp.btnEdit = mkBtn('✏️ 编辑', '进入编辑：修改「修改后」内容（保存后生效，可取消回滚）', 'qc-cmp-tool-btn qc-cmp-tool-edit');
+    cmp.btnEdit.addEventListener('click', () => cmpSetEditMode(true));
+    cmp.btnFmt = mkBtn('⚡ 格式优化', '按 Markdown 规范优化「修改后」格式（标题/列表/表格/脏符号，高亮保留）', 'qc-cmp-tool-btn qc-cmp-tool-fmt');
+    cmp.btnFmt.addEventListener('click', () => cmpFormatOptimize());
+    cmp.btnSave = mkBtn('💾 保存', '保存编辑内容并回到只读态', 'qc-cmp-tool-save');
+    cmp.btnSave.addEventListener('click', () => cmpSaveEdit());
+    cmp.btnCancel = mkBtn('✖ 取消', '丢弃本次编辑，恢复到编辑前内容', 'qc-cmp-tool-cancel');
+    cmp.btnCancel.addEventListener('click', () => cmpCancelEdit());
+    cmp.btnSave.style.display = 'none';
+    cmp.btnCancel.style.display = 'none';
+    bar.appendChild(cmp.btnCopy);
+    bar.appendChild(cmp.btnEdit);
+    bar.appendChild(cmp.btnFmt);
+    bar.appendChild(cmp.btnSave);
+    bar.appendChild(cmp.btnCancel);
+    return bar;
+  }
+
+  // 左侧扩展区整体（头部筛选 + 双列 textarea），由 createPanel 挂载
+  function buildCompareWrap() {
+    const wrap = document.createElement('div');
+    wrap.id = 'qc-compare-wrap';
+
+    // ── 头部：质检点 / 业务线 / 版本状态 + 获取原文按钮 ──
+    const head = document.createElement('div');
+    head.className = 'qc-cmp-head';
+    const mkLbl = (t) => {
+      const s = document.createElement('span');
+      s.className = 'qc-cmp-field-label';
+      s.textContent = t;
+      return s;
+    };
+
+    cmp.qpInput = document.createElement('input');
+    cmp.qpInput.className = 'qc-cmp-input';
+    cmp.qpInput.placeholder = '如 G21';
+    cmp.qpInput.title = '质检点编码';
+    cmp.qpInput.value = chatForm.qp || '';
+
+    cmp.bizSel = document.createElement('select');
+    cmp.bizSel.className = 'qc-cmp-input';
+    cmp.bizSel.title = '业务线（可选，提升匹配精度）';
+    const phOpt = document.createElement('option');
+    phOpt.value = '';
+    phOpt.textContent = '业务线(可选)';
+    cmp.bizSel.appendChild(phOpt);
+    const BIZ_OPTIONS = ['Antom AGH-天猫飞猪', 'Antom AGH-AB', 'Bettr HK', 'CN EC', 'CN Trade',
+      'GBA', 'WF EMEA', 'WFANZ', 'WFLT', 'WFSEA'];
+    BIZ_OPTIONS.forEach((name) => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      cmp.bizSel.appendChild(opt);
+    });
+    if (chatForm.biz && BIZ_OPTIONS.includes(chatForm.biz)) cmp.bizSel.value = chatForm.biz;
+
+    cmp.verSel = document.createElement('select');
+    cmp.verSel.className = 'qc-cmp-input';
+    cmp.verSel.title = '版本状态：发布版本走 getRuleVersionHistory 历史发布版；当前最新走 queryRuleByPage';
+    [['release', '发布版本'], ['latest', '当前最新(草稿)']].forEach((it) => {
+      const opt = document.createElement('option');
+      opt.value = it[0];
+      opt.textContent = it[1];
+      cmp.verSel.appendChild(opt);
+    });
+    cmp.verSel.value = chatForm.ver === 'draft' ? 'latest' : 'release';
+
+    cmp.fetchBtn = document.createElement('button');
+    cmp.fetchBtn.type = 'button';
+    cmp.fetchBtn.className = 'qc-cmp-fetch';
+    cmp.fetchBtn.textContent = '⇩ 获取原文';
+    cmp.fetchBtn.addEventListener('click', cmpFetchOriginal);
+
+    cmp.status = document.createElement('div');
+    cmp.status.className = 'qc-cmp-status';
+    cmp.status.textContent = '格式化完成后自动按对话框填写的质检点/业务线/版本状态获取原文；右列默认只读，点「编辑」修改，支持一键复制/格式优化（高亮保留）。';
+
+    head.appendChild(mkLbl('质检点'));
+    head.appendChild(cmp.qpInput);
+    head.appendChild(cmp.bizSel);
+    head.appendChild(cmp.verSel);
+    head.appendChild(cmp.fetchBtn);
+    head.appendChild(cmp.status);
+    wrap.appendChild(head);
+
+    // ── 双列：原文（只读，被替换区间高亮） / 修改后（原文+修改方式合并结果，可编辑） ──
+    const cols = document.createElement('div');
+    cols.className = 'qc-cmp-cols';
+
+    // 左列：规则原文（只读）+ 镜像层（画出被修改方式替换掉的区间）
+    const colO = document.createElement('div');
+    colO.className = 'qc-cmp-col';
+    const lblO = document.createElement('div');
+    lblO.className = 'qc-cmp-label';
+    lblO.textContent = '📄 规则原文（只读，橙色=已被修改的位置）';
+    const stackO = document.createElement('div');
+    stackO.className = 'qc-cmp-stack';
+    cmp.origMirror = document.createElement('div');
+    cmp.origMirror.className = 'qc-cmp-mirror qc-mirror-orig';
+    // 高亮覆盖层：不在文本流里插 <mark>（元素边界会改变折行导致漂移），
+    // 而是用 Range 量测标记的真实渲染矩形后绝对定位画上去
+    cmp.origHl = document.createElement('div');
+    cmp.origHl.className = 'qc-cmp-hl qc-hl-orig';
+    cmp.origTa = document.createElement('textarea');
+    cmp.origTa.className = 'qc-cmp-mod';
+    cmp.origTa.readOnly = true;
+    cmp.origTa.spellcheck = false;
+    cmp.origTa.placeholder = '自动获取规则原文中…';
+    cmp.origTa.addEventListener('scroll', () => {
+      if (cmp.origMirror) cmp.origMirror.scrollTop = cmp.origTa.scrollTop;
+      if (cmp.origHl) cmp.origHl.scrollTop = cmp.origTa.scrollTop;
+      // 滚动同步自检（与修改后列同逻辑）
+      if (cmp.origHl && Math.abs(cmp.origHl.scrollTop - cmp.origTa.scrollTop) > 3) {
+        const now = Date.now();
+        if (!cmp._syncWarnAtOrig || now - cmp._syncWarnAtOrig > 2000) { // 2 秒节流
+          cmp._syncWarnAtOrig = now;
+          console.warn('[QC 滚动同步诊断] 原文高亮层 scrollTop 追不上 textarea：', {
+            hl: cmp.origHl.scrollTop, ta: cmp.origTa.scrollTop,
+            hlMax: cmp.origHl.scrollHeight - cmp.origHl.clientHeight,
+            taMax: cmp.origTa.scrollHeight - cmp.origTa.clientHeight
+          });
+        }
+      }
+      cmpSyncScrollFromOrig(); // 原文滚动 → 修改后按比例同步
+    });
+    stackO.appendChild(cmp.origMirror);
+    stackO.appendChild(cmp.origHl);
+    stackO.appendChild(cmp.origTa);
+    colO.appendChild(lblO);
+    colO.appendChild(stackO);
+
+    // 右列：修改后（原文+修改方式合并，可编辑）+ 高亮覆盖层（替换进来的内容）
+    const colM = document.createElement('div');
+    colM.className = 'qc-cmp-col';
+    const lblM = document.createElement('div');
+    lblM.className = 'qc-cmp-label';
+    lblM.textContent = '✏️ 修改后（黄色=替换内容，只读·点「编辑」修改）';
+    cmp.modLbl = lblM; // 编辑态切换时更新列头提示
+    const stack = document.createElement('div');
+    stack.className = 'qc-cmp-stack';
+    cmp.mirror = document.createElement('div');
+    cmp.mirror.className = 'qc-cmp-mirror';
+    cmp.hl = document.createElement('div');
+    cmp.hl.className = 'qc-cmp-hl';
+    cmp.modTa = document.createElement('textarea');
+    cmp.modTa.className = 'qc-cmp-mod';
+    cmp.modTa.spellcheck = false;
+    cmp.modTa.readOnly = true; // 默认只读：点「编辑」解锁（编辑需显式触发）
+    cmp.modTa.placeholder = '获取原文后自动按「原文定位 → 修改方式替换」合并生成';
+    cmp.modTa.addEventListener('scroll', () => {
+      if (cmp.mirror) cmp.mirror.scrollTop = cmp.modTa.scrollTop;
+      if (cmp.hl) cmp.hl.scrollTop = cmp.modTa.scrollTop;
+      // 滚动同步自检：高亮层因滚动上限被钳制而追不上 textarea 时告警
+      //（两侧布局一致时不会触发；触发即说明高亮层可用滚动范围不足，高亮会随滚动整体错位）
+      if (cmp.hl && Math.abs(cmp.hl.scrollTop - cmp.modTa.scrollTop) > 3) {
+        const now = Date.now();
+        if (!cmp._syncWarnAt || now - cmp._syncWarnAt > 2000) { // 2 秒节流，避免滚动过程刷屏
+          cmp._syncWarnAt = now;
+          console.warn('[QC 滚动同步诊断] 高亮层 scrollTop 追不上 textarea：', {
+            hl: cmp.hl.scrollTop, ta: cmp.modTa.scrollTop,
+            hlMax: cmp.hl.scrollHeight - cmp.hl.clientHeight,
+            taMax: cmp.modTa.scrollHeight - cmp.modTa.clientHeight
+          });
+        }
+      }
+    });
+    cmp.modTa.addEventListener('input', cmpOnModInput);
+    stack.appendChild(cmp.mirror);
+    stack.appendChild(cmp.hl);
+    stack.appendChild(cmp.modTa);
+    colM.appendChild(lblM);
+    colM.appendChild(buildModToolbar());
+    colM.appendChild(stack);
+
+    cols.appendChild(colO);
+    cols.appendChild(colM);
+    wrap.appendChild(cols);
+    return wrap;
+  }
+
+  // 展开/收起对比区：对比区绝对定位挂在面板左缘向外扩展，面板本身宽度不变
+  function setCompareOpen(open) {
+    compareOpen = open;
+    if (!panelEl) return;
+    const wrap = panelEl.querySelector('#qc-compare-wrap');
+    if (wrap) wrap.style.display = open ? 'flex' : 'none';
+    const tab = panelEl.querySelector('#qc-compare-tab');
+    if (tab) {
+      tab.textContent = open ? '⇥ 收起对比' : '⇤ 原文对比';
+      tab.title = open ? '收起原文对比区' : '展开原文对比区（规则原文 vs 修改后）';
+    }
+    if (open) {
+      cmpRefreshFromState();
+      // 格式化结果已就绪时自动带参获取原文（用户无需重复填写质检点/业务线/版本状态）
+      if (lastExtracted && lastProblems.length) cmpAutoFetch();
+    }
+  }
+
+  // 用最新状态刷新对比区：有原文 → 重新执行「原文定位 → 修改方式替换」合并；
+  // 无原文 → 修改后退化为展示格式化内容
+  function cmpRefreshFromState() {
+    if (!cmp.modTa) return;
+    cmpRebuildMerged();
+  }
+
+  // 新一轮对话开始时清空对比区（原文与修改后一并清，避免上一轮内容串场）；
+  // 同时重置自动获取去重键与合并状态，新一轮格式化完成后会按新条件重新获取
+  function cmpResetContent() {
+    cmpSetEditMode(false); // 新一轮开始：退出编辑态，避免清空后仍停留在编辑中
+    cmp.original = '';
+    cmp.autoKey = '';
+    cmp.mergedMarks = [];
+    cmp.origMarks = [];
+    cmp.lastMerged = '';
+    cmp.lastModText = '';
+    if (cmp.origTa) cmp.origTa.value = '';
+    if (cmp.modTa) cmp.modTa.value = '';
+    cmpRepaintOrigMirror();
+    cmpRepaintModMirror();
+  }
+
+  function cmpSetStatus(text, cls) {
+    if (!cmp.status) return;
+    cmp.status.textContent = text;
+    cmp.status.className = 'qc-cmp-status' + (cls ? ' ' + cls : '');
+  }
+
+  // 自动带参获取原文：从对话框已填写的 质检点/业务线/规则版本（chatForm）取值，
+  // 缺失时兜底用格式化卡片解析出的质检点编码/业务线；同一条件只自动取一次，
+  // 用户可随时改头部输入后手动重取
+  function cmpAutoFetch() {
+    if (!cmp.qpInput) return;
+    const p0 = lastProblems[0] || {};
+    const qp = chatForm.qp || (p0.qcRefs && p0.qcRefs[0]) || '';
+    const biz = chatForm.biz || p0.qcBizLine || '';
+    const ver = chatForm.ver === 'draft' ? 'latest' : 'release';
+    if (!qp) return; // 连兜底都解析不出编码，不发起请求
+    // 回填到头部输入框（业务线选项不存在时跳过回填，避免造出非法 option）
+    cmp.qpInput.value = qp;
+    if (biz) {
+      const has = Array.from(cmp.bizSel.options).some((o) => o.value === biz);
+      if (has) cmp.bizSel.value = biz;
+    }
+    cmp.verSel.value = ver;
+    const key = qp + '|' + (cmp.bizSel.value || '') + '|' + ver;
+    if (key === cmp.autoKey && cmp.original) return; // 同条件已取过，不重复请求
+    cmpFetchOriginal();
+  }
+
+  // 富文本原文 → 纯文本（在坐标系源头处理：剥后文本同时作为 textarea 值、标记偏移、合并基准，
+  // 三者天然同源，不再出现 origMarks 偏在标签起点、选区把 <p> 字面量包进来的问题）。
+  // 块级闭合标签转换行防段落粘连，实体还原成字符；纯文本输入不受影响（幂等）
+  function cmpRichToPlain(s) {
+    return String(s || '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/(p|div|li|h[1-6]|tr|blockquote)>/gi, '\n')
+      .replace(/<[^>]{0,400}>/g, '')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&apos;/gi, "'")
+      .replace(/&#(\d{1,5});/g, (m, d) => { try { return String.fromCodePoint(+d); } catch (e) { return m; } })
+      .replace(/&#x([0-9a-fA-F]{1,5});/g, (m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch (e) { return m; } })
+      .replace(/&amp;/gi, '&') // &amp; 最后解码，避免 &amp;lt; 二次解码
+      .replace(/[ \t]+$/gm, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  // 获取原文：按当前选择的 质检点/业务线/版本状态 走后台页面接口链路
+  async function cmpFetchOriginal() {
+    if (cmp.fetchBtn && cmp.fetchBtn.disabled) return; // 请求进行中：自动/手动触发不并发
+    const qp = (cmp.qpInput.value || '').trim();
+    const biz = cmp.bizSel.value || '';
+    const ver = cmp.verSel.value || 'release';
+    chatForm.qp = qp;
+    if (biz) chatForm.biz = biz;
+    chatForm.ver = ver === 'latest' ? 'draft' : 'release';
+    if (!qp) { cmpSetStatus('⚠️ 请先填写质检点编码（如 G21）', 'err'); return; }
+    if (cmp.fetchBtn) { cmp.fetchBtn.disabled = true; cmp.fetchBtn.textContent = '⏳ 获取中…'; }
+    cmpSetStatus('⏳ 正在通过页面接口获取原文（首次可能需加载规则管理页，请稍候）…', 'info');
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: 'qc-fetch-rule-original', qp, biz, ver });
+      if (resp && resp.ok && resp.original) {
+        // 富文本剥离 + 归一化换行：textarea 赋值时会把 \r\n 折叠成 \n，且富文本原文
+        //（<p>、&nbsp; 等）若不剥掉，标记偏移会指在标签起点、选区把标签字面量包进来；
+        // 在源头剥成纯文本后，偏移坐标系全程一致（cmpRichToPlain 内已做 \r\n 归一化）
+        cmp.original = cmpRichToPlain(resp.original);
+        cmp.autoKey = qp + '|' + biz + '|' + ver; // 记录已成功获取的条件（自动获取去重用）
+        // 核心合并：把各条目的「修改方式」按「原文定位」替换进原文，生成修改后全文
+        const m = cmpRebuildMerged();
+        cmpSetStatus('✅ 原文已加载', 'ok');
+        qcTrack('原文对比获取', { result: 'success', qp, biz, ver, len: cmp.original.length, merged: m ? m.applied : 0 });
+      } else {
+        cmpSetStatus('❌ ' + ((resp && resp.hint) || (resp && resp.error) || '获取失败'), 'err');
+        qcTrack('原文对比获取', { result: 'fail', qp, biz, ver, error_code: String((resp && resp.error) || 'unknown') });
+      }
+    } catch (e) {
+      cmpSetStatus('❌ 获取异常：' + String(e && e.message || e), 'err');
+      qcTrack('原文对比获取', { result: 'fail', qp, biz, ver, error_code: 'exception' });
+    } finally {
+      if (cmp.fetchBtn) { cmp.fetchBtn.disabled = false; cmp.fetchBtn.textContent = '⇩ 获取原文'; }
+    }
+  }
+
+  // ── 原文滚动 → 修改后按比例同步（对比看）──
+  function cmpSyncScrollFromOrig() {
+    if (!cmp.origTa || !cmp.modTa || cmp.syncLock) return;
+    cmp.syncLock = true;
+    try {
+      const o = cmp.origTa, m = cmp.modTa;
+      const maxO = o.scrollHeight - o.clientHeight;
+      const maxM = m.scrollHeight - m.clientHeight;
+      m.scrollTop = maxO > 0 ? Math.round((o.scrollTop / maxO) * maxM) : 0;
+      if (cmp.mirror) cmp.mirror.scrollTop = m.scrollTop;
+      if (cmp.hl) cmp.hl.scrollTop = m.scrollTop; // 黄色高亮层同步，避免原文联动滚动时高亮掉队
+    } catch (e) { /* 忽略 */ }
+    cmp.syncLock = false;
+  }
+
+  // 对比区差异子段计算：对「被替换的原文段」与「修改方式」做字符级 LCS diff，
+  // 产出 added（修改方式新增段 → 修改后列高亮）与 removed（原文被删段 → 原文列高亮）。
+  // 与卡片 diffBoldHtml 同源思路——卡片用加粗标差异，textarea 内无法加粗
+  //（也不允许：镜像层必须纯文本，内联样式会破坏逐像素折行对齐），故用多个高亮矩形替代。
+  // 超长段降级：面积超限返回 fallback=true，调用方退回整段高亮，避免 O(n·m) 卡顿
+  function cmpDiffSegMarks(origSeg, fix) {
+    const out = { added: [], removed: [], fallback: false };
+    const n = origSeg.length, mLen = fix.length;
+    if (n * mLen > 1500000 || n > 3000 || mLen > 3000) { out.fallback = true; return out; }
+    const ops = diffLcs(origSeg, fix); // {s:'='|'+'|'-', v} 字符级操作序列
+    let ia = 0, ib = 0;                // ia: 原文段游标，ib: 修改方式游标
+    let aS = -1, aE = -1, rS = -1, rE = -1;
+    const flush = () => {
+      if (aE > aS) out.added.push({ start: aS, end: aE });
+      if (rE > rS) out.removed.push({ start: rS, end: rE });
+      aS = aE = rS = rE = -1;
+    };
+    for (const op of ops) {
+      if (op.s === '=') { flush(); ia++; ib++; }
+      else if (op.s === '+') { if (aS < 0) aS = ib; aE = ib + 1; ib++; }
+      else { if (rS < 0) rS = ia; rE = ia + 1; ia++; }
+    }
+    flush();
+    return out;
+  }
+
+  // 取某条问题在标记列表中的整体区间：细粒度化后同一条目有多个子标记，
+  // 取最早起点到最晚终点，供「定位原文」选中整块
+  function cmpProblemMarkRange(marks, p) {
+    let s = -1, e = -1;
+    for (const x of marks) {
+      if (x.p !== p) continue;
+      if (s < 0 || x.start < s) s = x.start;
+      if (x.end > e) e = x.end;
+    }
+    return e > s ? { start: s, end: e } : null;
+  }
+
+  // ══════════ 核心合并：原文定位 → 修改方式替换 ══════════
+  // 把每条问题的「修改方式」按其「原文定位」在原文中找到位置并替换，
+  // 产出修改后全文 + 两侧高亮区间（差异细粒度：只标真正变化的子段，等价卡片差异加粗）：
+  //   mergedMarks：修改后文本中新增的变化子段（黄色高亮，一条修改可对应多个子段）
+  //   origMarks  ：原文文本中被删除/替换的变化子段（橙色高亮）
+  // 未定位到原文位置的条目跳过（不强行拼接），数量由调用方在状态条提示
+  function cmpBuildMerged() {
+    const orig = cmp.original || '';
+    const probs = lastProblems.filter((p) => p.locate && p.fix);
+    const hits = [];
+    for (const p of probs) {
+      const r = cmpFindRange(orig, p.locate);
+      // 只采纳高置信命中（≥0.5）做自动替换；低分候选留给「定位原文」滚动提示，
+      // 避免把修改方式替换到错误位置
+      if (r && r.end > r.start && r.score >= 0.5) hits.push({ start: r.start, end: r.end, p });
+    }
+    // 按起点排序并剔除重叠区间（保留先命中的，避免替换错位）
+    hits.sort((a, b) => a.start - b.start || b.end - a.end);
+    const clean = [];
+    let lastEnd = -1;
+    for (const h of hits) {
+      if (h.start < lastEnd) continue; // 与前一个区间重叠：跳过
+      clean.push(h);
+      lastEnd = h.end;
+    }
+    // 从后往前替换，保证文本切片正确。
+    // ⚠️ 标记坐标修正（高亮上偏的真正根因，v5.4.4 抽样实锤：首段 ok、4639 起全失配、
+    // 失配内容是前一段的尾巴 → 标记指早）：h.start 是「原文坐标」，但更早命中的替换
+    // 会改变文本长度（本例 8645→9315，净增 670 字），其后内容的真实位置必须加上
+    // 前面所有命中的累计偏移。首条命中前面无替换 → 恰好正确（首段永远准），
+    // 越往后累计偏移越大 → 越往后偏得越多。原文列标记用原文坐标查原文文本，天然正确，
+    // 这解释了为何只有修改后列错位。
+    const prefixDelta = [];
+    let acc = 0;
+    for (const h of clean) {
+      prefixDelta.push(acc);
+      acc += h.p.fix.length - (h.end - h.start);
+    }
+    let text = orig;
+    const mergedMarks = [], origMarks = [];
+    for (let i = clean.length - 1; i >= 0; i--) {
+      const h = clean[i];
+      const off = prefixDelta[i]; // 该命中在合并文本中的累计偏移
+      text = text.slice(0, h.start) + h.p.fix + text.slice(h.end);
+      // 差异细粒度高亮：只标真正变化的子段（等价于卡片里的差异加粗），
+      // 未改动的文字不再整段刷色；diff 降级时退回整段高亮，保证替换位置始终有提示
+      const d = cmpDiffSegMarks(orig.slice(h.start, h.end), h.p.fix);
+      if (d.fallback) {
+        mergedMarks.push({ start: h.start + off, end: h.start + off + h.p.fix.length, p: h.p, t: h.p.fix });
+        origMarks.push({ start: h.start, end: h.end, p: h.p, t: orig.slice(h.start, h.end) });
+      } else {
+        // 修改后列：细粒度高亮 added（修改方式相对原文新增的子段）——
+        // 用户看修改后列想知道「具体改成了什么」，新增部分高亮即可
+        for (const a of d.added) mergedMarks.push({ start: h.start + off + a.start, end: h.start + off + a.end, p: h.p, t: h.p.fix.slice(a.start, a.end) });
+        // 原文列：整段高亮 [h.start, h.end)——整段原文都被替换掉了，
+        // 用户看原文列想知道「哪段被改了」，整段高亮最清晰。
+        // 之前用 d.removed 细粒度：当原文段与修改方式高度相似时 LCS 只匹配出极少被删字符
+        //（往往只剩一个标点），造成「一段话只高亮一个标点」的缺失假象
+        origMarks.push({ start: h.start, end: h.end, p: h.p, t: orig.slice(h.start, h.end) });
+      }
+    }
+    mergedMarks.sort((a, b) => a.start - b.start);
+    origMarks.sort((a, b) => a.start - b.start);
+    // 合并抽样自动输出（无需 Console 开关）：核对高亮子段偏移指向的内容——
+    // 屏幕高亮盖住的文字若与抽样 content 一致 → 绘制问题；不一致 → 偏移数据问题
+    try {
+      console.log('[QC 合并抽样] 全文 ' + text.length + ' 字 · 合并 ' + clean.length + '/' + probs.length +
+        ' 条 · 高亮子段 ' + mergedMarks.length + ' 个，前 5 段：',
+        mergedMarks.slice(0, 5).map((mk) => ({
+          start: mk.start, end: mk.end,
+          content: text.slice(mk.start, mk.start + 30)
+        })));
+    } catch (e) { /* 忽略 */ }
+    return { text, mergedMarks, origMarks, applied: clean.length, total: probs.length };
+  }
+
+  // 重建对比区内容：有原文 → 重新合并；无原文 → 修改后展示格式化内容（兜底）。
+  // 用户已在修改后手动编辑过（内容 ≠ 上次合并产出）时不覆盖，保护手工修改。
+  // force=true 时跳过手工保护：卡片「修改方式」编辑保存后调用，用最新 fix 重算合并，
+  // 覆盖修改后 textarea 的手工改动——用户明确改了 fix，合并产物就该同步
+  function cmpRebuildMerged(force) {
+    if (!cmp.modTa || !cmp.origTa) return null;
+    if (!cmp.original) {
+      cmp.origTa.value = '';
+      cmp.origMarks = [];
+      if (cmp.modTa.value !== (lastExtracted || '')) cmp.modTa.value = lastExtracted || '';
+      cmp.mergedMarks = [];
+      cmp.lastMerged = cmp.modTa.value;
+      // cmp.lastModText 挪到 cmpRepaintModMirror 内赋值：确保绘制完成后才开放增量平移
+      cmpRepaintOrigMirror();
+      cmpRepaintModMirror();
+      return null;
+    }
+    // 用户手动编辑过修改后：保留手工内容，只刷新高亮（cmp.lastModText 在 cmpRepaintModMirror 内设）
+    // force=true（卡片编辑保存触发）时跳过此保护，重算合并覆盖手工改动
+    if (!force && cmp.modTa.value !== cmp.lastMerged && cmp.lastMerged) {
+      cmpRepaintOrigMirror();
+      cmpRepaintModMirror();
+      return { applied: new Set(cmp.mergedMarks.map((x) => x.p)).size, total: lastProblems.filter((p) => p.locate && p.fix).length };
+    }
+    cmp.origTa.value = cmp.original;
+    const m = cmpBuildMerged();
+    cmp.modTa.value = m.text;
+    cmp.mergedMarks = m.mergedMarks;
+    cmp.origMarks = m.origMarks;
+    cmp.lastMerged = m.text;
+    // cmp.lastModText 挪到 cmpRepaintModMirror 内赋值：绘制完成后才开放增量平移，
+    // 否则 200ms 防抖窗口内用户敲字会用旧基准计算增量，把标记平移坏（v5.4.2 实锤：5/6 失配）
+    cmpRepaintOrigMirror();
+    cmpRepaintModMirror();
+    return m;
+  }
+
+  // ── 高亮渲染：替换完成后一次性整体高亮 ──
+  // 镜像层只放纯文本（与 textarea 折行逐像素一致，不再插任何 <mark> 元素——
+  // 元素边界会改变折行决策，导致第 2 个标记起累积漂移）。
+  // 高亮改用 Range 在纯文本镜像上量测标记的真实渲染矩形（含逐行拆分），
+  // 以绝对定位矩形画到覆盖层上——高亮不参与文本流，永不漂移。
+  // ⚠️ innerHTML 重建会把 scrollTop 归零：必须先记下滚动位置，重建后恢复，
+  // 否则量测坐标系（未滚动）与 textarea 实际滚动窗不一致，高亮整体错位
+  function cmpRepaintOrigMirror() {
+    if (!cmp.origMirror || !cmp.origTa) return;
+    try {
+      const st = cmp.origTa.scrollTop;
+      cmp.origMirror.innerHTML = esc(cmp.origTa.value); // 纯文本
+      cmp.origMirror.scrollTop = st;                    // 重建后恢复滚动
+      cmpPaintMarks(cmp.origTa, cmp.origMirror, cmp.origHl, cmp.origMarks);
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function cmpRepaintModMirror() {
+    if (!cmp.mirror || !cmp.modTa) return;
+    try {
+      const st = cmp.modTa.scrollTop;
+      cmp.mirror.innerHTML = esc(cmp.modTa.value); // 纯文本
+      cmp.mirror.scrollTop = st;                   // 重建后恢复滚动
+      cmpPaintMarks(cmp.modTa, cmp.mirror, cmp.hl, cmp.mergedMarks);
+      // 绘制完成后才开放增量平移：cmp.lastModText 必须与已绘制的标记同源，
+      // 否则 200ms 防抖窗口内用户敲字会用旧基准计算增量，把标记平移坏（v5.4.2 实锤：5/6 失配）
+      cmp.lastModText = cmp.modTa.value;
+    } catch (e) { /* 忽略 */ }
+  }
+
+  // 用 Range 量测标记区间在镜像纯文本中的真实渲染矩形（自动按视觉行拆分），
+  // 画到覆盖层 hl（内容坐标系 = 镜像内容坐标，hl.scrollTop 与 textarea 同步滚动）
+  function cmpPaintMarks(ta, mirror, hl, marks) {
+    if (!hl) return;
+    hl.innerHTML = '';
+    const text = ta.value || '';
+    // 流内占位【无条件重建】：即使本帧没有任何标记也必须撑出 hl 的 scrollHeight。
+    // 之前空标记帧在这里提前 return、把占位一并清掉 → hl 变回不可滚动（hlMax=0），
+    // 之后每次滚动 hl 都被钳在 0、高亮整体掉队（console 实锤：hl:0/hlMax:0，
+    // 而 textarea 已滚到 ta:2639/taMax:7636）。占位必须在任何提前 return 之前建好
+    const spacer = document.createElement('div');
+    spacer.style.cssText = 'height:' + mirror.scrollHeight + 'px;width:1px;' +
+      'visibility:hidden;pointer-events:none';
+    hl.appendChild(spacer);
+    hl.scrollTop = mirror.scrollTop; // 空标记帧同样保持与 textarea 的滚动同步
+    if (!marks || !marks.length || !text || !mirror.firstChild) return;
+    const node = mirror.firstChild;
+    if (node.nodeType !== Node.TEXT_NODE) return;
+    const base = mirror.getBoundingClientRect();
+    // 对齐诊断：高亮坐标全部量自镜像层，镜像与 textarea 的折行布局必须逐像素一致。
+    // 若滚动高度/内容宽度分歧，说明两者换行相关属性被宿主页面 CSS 差异化覆盖，
+    // 高亮会随文档位置累积漂移（首段准、越往下越偏）——控制台输出具体分歧项
+    if (mirror.scrollHeight !== ta.scrollHeight || mirror.clientWidth !== ta.clientWidth) {
+      const csM = getComputedStyle(mirror), csT = getComputedStyle(ta);
+      console.warn('[QC 高亮对齐诊断] 镜像层与 textarea 布局不一致：', {
+        mirrorScrollHeight: mirror.scrollHeight, taScrollHeight: ta.scrollHeight,
+        mirrorClientWidth: mirror.clientWidth, taClientWidth: ta.clientWidth,
+        mirrorFont: csM.font, taFont: csT.font,
+        mirrorWhiteSpace: csM.whiteSpace, taWhiteSpace: csT.whiteSpace,
+        mirrorWordBreak: csM.wordBreak, taWordBreak: csT.wordBreak,
+        mirrorOverflowWrap: csM.overflowWrap, taOverflowWrap: csT.overflowWrap,
+        mirrorLineHeight: csM.lineHeight, taLineHeight: csT.lineHeight,
+        mirrorLetterSpacing: csM.letterSpacing, taLetterSpacing: csT.letterSpacing
+      });
+    }
+    // 数据抽样诊断（自动输出 + 2 秒节流，无需 Console 开关——content 脚本运行在
+    // 隔离 world，Console 设的 window 变量它看不到，开关方案无效）：
+    // 核对抽样 content 是否就是屏幕上高亮盖住的那段文字——
+    // 一致 → 绘制路径问题；不一致（指早了）→ 标记偏移数据问题
+    if (marks.length) {
+      const isMod = ta === cmp.modTa;
+      const sKey = isMod ? '_sampleAtMod' : '_sampleAtOrig'; // 两列独立节流：共用一键时先画的列把后画的吃掉
+      const now = Date.now();
+      if (!cmp[sKey] || now - cmp[sKey] > 2000) {
+        cmp[sKey] = now;
+        // 内容自检：m.t 为构建时的预期文本，失配 ⇒ 标记偏移/过期（数据层实锤）
+        let bad = 0;
+        for (const m of marks) if (typeof m.t === 'string' && text.slice(m.start, m.end) !== m.t) bad++;
+        console.log('[QC 高亮数据抽样] ' + (isMod ? '修改后列' : '原文列') +
+          ' text=' + text.length + ' 字 · 内容失配 ' + bad + '/' + marks.length +
+          ' · 镜像SH=' + mirror.scrollHeight + '/taSH=' + ta.scrollHeight +
+          ' · st=' + mirror.scrollTop + '/hlSt=' + hl.scrollTop + '：',
+          marks.slice(0, 5).map((m) => ({
+            start: m.start, end: m.end,
+            ok: typeof m.t === 'string' ? text.slice(m.start, m.end) === m.t : '?',
+            content: text.slice(m.start, m.start + 30)
+          })));
+      }
+    }
+    const frag = document.createDocumentFragment();
+    for (const m of marks) {
+      if (!(m.end > m.start) || m.start < 0 || m.end > text.length) continue;
+      try {
+        const r = document.createRange();
+        r.setStart(node, m.start);
+        r.setEnd(node, m.end);
+        const rects = r.getClientRects();
+        for (let i = 0; i < rects.length; i++) {
+          const rc = rects[i];
+          if (rc.width <= 0 || rc.height <= 0) continue;
+          const el = document.createElement('i');
+          // 内容坐标：视口坐标 − 镜像原点 + 镜像已滚过的距离（hl 用 scrollTop 对齐同一内容窗）
+          // position:absolute 内联兜底：正常由 CSS .qc-cmp-hl i 提供，防外部样式覆盖后高亮塌陷
+          el.style.cssText = 'position:absolute;left:' + (rc.left - base.left) + 'px;top:' +
+            (rc.top - base.top + mirror.scrollTop) + 'px;width:' + rc.width + 'px;height:' + rc.height + 'px';
+          frag.appendChild(el);
+        }
+      } catch (e) { /* 忽略 */ }
+    }
+    hl.appendChild(frag);
+    hl.scrollTop = mirror.scrollTop;
+  }
+
+  // 编辑「修改后」的标记维护：与原文列同逻辑——标记位置是确定性的，不做任何模糊重算。
+  // 每次 input 事件立即做一次「编辑增量平移」（快速连续编辑各自独立处理，
+  // 不会因防抖把两处编辑合并成一次增量导致平移量错误）：
+  //   改动点之前的标记不动；之后的整体平移 Δ；直接被改到的标记摘除。
+  // 模糊重算会让相同/相似内容的标记吸附漂移（高亮位置偏移的根源），已弃用
+  function cmpOnModInput() {
+    if (cmp.mirror) cmp.mirror.scrollTop = cmp.modTa.scrollTop;
+    cmpApplyEditDelta();
+    scheduleCmpRepaint(); // 防抖只负责重绘镜像层（大文本每次键入全量重建 HTML 有开销）
+  }
+
+  // 对本次输入做增量平移（同步执行）
+  function cmpApplyEditDelta() {
+    if (!cmp.modTa) return;
+    const oldV = cmp.lastModText;
+    const newV = cmp.modTa.value;
+    // cmp.lastModText 不在这里更新——要等 cmpRepaintModMirror 绘制完成后才赋值，
+    // 否则 200ms 防抖窗口内多次敲字会让基准与绘制状态脱节（v5.4.3 实锤：3/4 失配）
+    if (!cmp.mergedMarks.length || oldV == null || oldV === newV) return;
+    // 求编辑增量：公共前缀 p + 公共后缀 s → 改动区间 [p, oldEnd) → [p, newEnd)
+    let p = 0;
+    const minL = Math.min(oldV.length, newV.length);
+    while (p < minL && oldV[p] === newV[p]) p++;
+    let s = 0;
+    while (s < minL - p && oldV[oldV.length - 1 - s] === newV[newV.length - 1 - s]) s++;
+    const oldEnd = oldV.length - s;
+    const delta = (newV.length - s) - oldEnd;
+    if (delta === 0 && oldEnd <= p) return; // 无实际改动
+    // 纯插入（oldEnd===p，没有旧字符被删）：跨插入点的标记整体扩展 delta，位置仍准；
+    // 有删除/替换（oldEnd>p）碰到标记：保留标记不摘除（v5.4.8：用户要求编辑时高亮不消失），
+    // start 不动、end 按 delta 平移；删除过多导致 end≤start 时夹到 start+1，保证至少 1 字高亮。
+    // 内容已变，弃用自检基准 t
+    const pureInsert = oldEnd <= p;
+    cmp.mergedMarks = cmp.mergedMarks
+      .map((mk) => {
+        if (mk.end <= p) return mk;                                   // 改动点之前：不动
+        if (mk.start >= oldEnd) return { start: mk.start + delta, end: mk.end + delta, p: mk.p, t: mk.t }; // 之后：平移（内容不变，保留自检基准）
+        if (pureInsert) return { start: mk.start, end: mk.end + delta, p: mk.p, t: undefined }; // 纯插入穿过标记：整体扩展（内容掺入新字符，弃用自检基准）
+        // 有删改且碰到标记：保留，end 按 delta 平移；ne≤ns 时夹到 ns+1 保证高亮不消失
+        const ns = mk.start;
+        const ne = mk.end + delta;
+        return { start: ns, end: Math.max(ne, ns + 1), p: mk.p, t: undefined };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.start - b.start);
+  }
+
+  // 重绘镜像层（标记已由 cmpApplyEditDelta 增量维护，这里只做渲染）
+  function scheduleCmpRepaint() {
+    if (cmp.repaintTimer) clearTimeout(cmp.repaintTimer);
+    cmp.repaintTimer = setTimeout(() => {
+      cmp.repaintTimer = null;
+      if (!cmp.modTa) return;
+      cmpRepaintModMirror();
+    }, 200);
+  }
+
+  // ══════════ 对比区定位算法（抗改写/富文本/换行差异） ══════════
+
+  // 长度保持清洗：HTML 标签/实体 → 等长空格。接口原文常是富文本（<p>、&nbsp; 等），
+  // 实体若不处理会变成字母混进内容流污染匹配；等长替换保证字符偏移映射不变
+  function cmpLenSafeStrip(s) {
+    return String(s || '')
+      .replace(/<[^>]{0,400}>/g, (m) => ' '.repeat(m.length))
+      .replace(/&(?:nbsp|lt|gt|amp|quot|apos|#\d{1,5}|#x[0-9a-fA-F]{1,5});/g, (m) => ' '.repeat(m.length));
+  }
+
+  // 对比区专用内容化：只保留 字母/数字/汉字（空格/标点/md 符号全去掉），
+  // 两侧空格、全半角标点、换行差异不再影响匹配；map[i] = 内容第 i 字在原串的偏移
+  function cmpToChars(s) {
+    const text = [], map = [];
+    const src = String(s || '');
+    for (let i = 0; i < src.length; i++) {
+      const ch = src[i];
+      if (/[0-9A-Za-z一-龥]/.test(ch)) { text.push(ch.toLowerCase()); map.push(i); }
+    }
+    return { text: text.join(''), map };
+  }
+
+  // 短块探测：把目标内容切成 12 字小块，逐块在原文内容流中找精确出现位置，
+  // 按「块出现位置 − 块在目标中的偏移」估计目标起点并聚类，取最密集簇。
+  // 局部改写/措辞调整时其余块仍会命中，能定位到"附近"；score ≈ 命中块覆盖率
+  function cmpChunkProbe(target, hay) {
+    const L = target.length;
+    if (L < 14) return null;
+    const chunkLen = 12, step = 6;
+    const hits = [];
+    for (let i = 0; i + chunkLen <= L; i += step) {
+      const chunk = target.slice(i, i + chunkLen);
+      let idx = hay.indexOf(chunk);
+      let guard = 0;
+      while (idx !== -1 && guard++ < 60) {
+        hits.push(idx - i); // 该块推出的目标起点估计
+        idx = hay.indexOf(chunk, idx + 1);
+      }
+    }
+    if (hits.length < 2) return null;
+    hits.sort((a, b) => a - b);
+    const win = Math.max(30, Math.floor(L / 4));
+    let best = null;
+    let i = 0;
+    while (i < hits.length) {
+      let j = i;
+      while (j < hits.length && hits[j] - hits[i] <= win) j++;
+      const cnt = j - i;
+      if (!best || cnt > best.cnt) best = { s: hits[i], cnt };
+      i = Math.max(i + 1, j > i + 1 ? j - 1 : i + 1);
+    }
+    if (!best || best.cnt < 2) return null;
+    const start = Math.max(0, best.s);
+    const end = Math.min(hay.length, start + L);
+    if (end <= start) return null;
+    return { start, end, score: Math.min(0.9, (best.cnt * step) / L), mode: 'chunk', chunkHits: best.cnt };
+  }
+
+  // 在文本中定位 locateField，返回 {start,end,score,mode}（原始偏移）或 null。
+  // 五级候选取最优：整体精确 → 整行锚点 → 整体滑窗 → 逐行滑窗 → 短块聚类。
+  // 低分候选也返回（score 字段区分），由调用方决定"合并 adoption"还是"仅滚动提示"
+  function cmpFindRange(text, locateField, fromOffset) {
+    if (!text || !locateField) return null;
+    const hay0 = cmpLenSafeStrip(text);
+    const field0 = cmpLenSafeStrip(String(locateField));
+    const hay = cmpToChars(hay0);
+    const target = cmpToChars(field0).text;
+    if (target.length < 2 || hay.text.length < 4) return null;
+    // fromOffset：只在该原始偏移之后搜索（多条相同/相似内容按顺序各归各位，不挤到第一处）
+    let fromC = 0;
+    if (fromOffset > 0) {
+      let lo = 0, hi = hay.map.length; // 二分：第一个 map[i] >= fromOffset 的内容下标
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (hay.map[mid] < fromOffset) lo = mid + 1; else hi = mid;
+      }
+      fromC = lo;
+      if (fromC >= hay.text.length) return null;
+    }
+    // 搜索在 sub（内容流自 fromC 起的截断）上进行，命中后统一 +fromC 还原全局内容下标
+    const sub = hay.text.slice(fromC);
+    // 行/句切分：换行 + 中文句读，给锚点和逐行定位用
+    const lines = field0.split(/\n+|[。；;！？]/)
+      .map((l) => cmpToChars(l).text)
+      .filter((l) => l.length >= 6);
+    const cands = [];
+    // ① 整体精确
+    const ex = sub.indexOf(target);
+    if (ex !== -1) cands.push({ start: ex + fromC, end: ex + target.length + fromC, score: 1, mode: 'exact' });
+    // ② 整行锚点（最长的几行整行精确出现后回推起点，对重复短句最稳）
+    const ab = anchorLocate(target, lines, sub);
+    if (ab) cands.push({ start: ab.start + fromC, end: ab.end + fromC, score: ab.score, mode: 'anchor' });
+    // ③ 整体滑窗模糊
+    if (target.length >= 4) {
+      const fw = locateWindow(target, sub);
+      if (fw) cands.push({ start: fw.start + fromC, end: fw.end + fromC, score: fw.score, mode: 'window' });
+    }
+    // ④ 逐行滑窗：每行独立找最相似位置（行级措辞调整/换行差异时仍命中附近），
+    //    取最优行，区间向两侧扩到 ≈ 目标长度（覆盖相邻行）
+    let bestLine = null;
+    for (const ln of lines) {
+      if (ln.length < 8 || ln.length > 400) continue;
+      const r = locateWindow(ln, sub);
+      if (r && (!bestLine || r.score > bestLine.r.score)) bestLine = { r, ln };
+    }
+    if (bestLine && bestLine.r.score >= 0.6) {
+      const pad = Math.floor((target.length - (bestLine.r.end - bestLine.r.start)) / 2);
+      const s2 = Math.max(0, bestLine.r.start - Math.max(0, pad));
+      const e2 = Math.min(sub.length, bestLine.r.end + Math.max(0, pad));
+      cands.push({ start: s2 + fromC, end: e2 + fromC, score: bestLine.r.score * 0.85, mode: 'line' });
+    }
+    // ⑤ 短块聚类探测
+    const cp = cmpChunkProbe(target, sub);
+    if (cp) cands.push({ start: cp.start + fromC, end: cp.end + fromC, score: cp.score, mode: cp.mode });
+    if (!cands.length) return null;
+    cands.sort((a, b) => b.score - a.score);
+    const best = cands[0];
+    if (best.start >= hay.map.length) return null;
+    const start = hay.map[best.start];
+    const endChar = Math.min(best.end, hay.map.length) - 1;
+    const end = endChar >= 0 ? hay.map[endChar] + 1 : start;
+    if (end <= start) return null;
+    return { start, end, score: best.score, mode: best.mode };
+  }
+
+  // 对比区定位：卡片「📍 定位原文」→ 主定位在「原文」textarea：选中该原文定位对应内容、
+  // 自动滚动到该位置并高亮（原生选区 + 橙色标记区）；同时联动修改后 textarea 滚到
+  // 对应替换区间（该条修改方式所在位置），两侧对照看。
+  // 低相似度命中也会滚动到最接近位置（toast 提示相似度），不再直接放弃
+  function locateInCompare(locateField, problem) {
+    if (!cmp.origTa) return false;
+    if (!cmp.origTa.value) {
+      showToast('⚠️ 原文尚未获取，请先在对比区点「获取原文」');
+      return false;
+    }
+    const o = cmp.origTa, m = cmp.modTa;
+    let ok = false;
+
+    // ── 精确滚动工具：镜像层是纯文本（与 textarea 折行逐像素一致），
+    //    用 Range 量测偏移处的真实渲染位置（含软换行的视觉行），
+    //    取代旧"换行符行数×行高"估算（长段落自动折行时会严重偏小、滚不到位置）
+    const scrollToOffset = (ta, mirror, offset) => {
+      if (!mirror || !mirror.firstChild) return false;
+      try {
+        const node = mirror.firstChild;
+        if (node.nodeType !== Node.TEXT_NODE) return false;
+        const off = Math.min(Math.max(0, offset), node.length);
+        if (off >= node.length) return false;
+        const r = document.createRange();
+        r.setStart(node, off);
+        r.setEnd(node, off + 1); // 展开一个字符，确保有渲染盒
+        const rect = r.getBoundingClientRect();
+        if (!rect || !rect.height) return false;
+        const base = mirror.getBoundingClientRect();
+        ta.scrollTop = Math.max(0, rect.top - base.top + mirror.scrollTop - ta.clientHeight * 0.4);
+        mirror.scrollTop = ta.scrollTop;
+        if (cmp.hl && ta === cmp.modTa) cmp.hl.scrollTop = ta.scrollTop;
+        if (cmp.origHl && ta === cmp.origTa) cmp.origHl.scrollTop = ta.scrollTop;
+        return true;
+      } catch (e) { return false; }
+    };
+
+    // ① 原文：优先复用合并时已确认准确的标记区间（与橙色高亮完全一致），
+    //    细粒度化后一条目对应多个子标记，取整体区间；未合并成功的条目才重新走五级候选匹配
+    let rngO = null;
+    if (problem) {
+      const r = cmpProblemMarkRange(cmp.origMarks, problem);
+      if (r) rngO = { start: r.start, end: r.end, score: 1, mode: 'mark' };
+    }
+    if (!rngO) rngO = cmpFindRange(o.value, locateField);
+    if (rngO) {
+      o.focus();
+      try { o.setSelectionRange(rngO.start, rngO.end); } catch (e) { /* 忽略 */ }
+      scrollToOffset(o, cmp.origMirror, rngO.start); // Range 量测精确滚动
+      ok = true;
+      if (rngO.mode === 'mark' || rngO.score >= 0.5) {
+        showToast('✅ 已定位到原文' + (rngO.mode === 'mark' ? '（合并标记位置）' :
+          rngO.mode === 'exact' ? '' : '（相似匹配 ' + Math.round(rngO.score * 100) + '%）'));
+      } else {
+        showToast('⚠️ 相似度较低（' + Math.round(rngO.score * 100) + '%），已滚动到最接近位置，请人工核对');
+      }
+    } else {
+      // 完全无候选：输出诊断（控制台可见原文定位字段与原文开头），方便反馈修复
+      showToast('⚠️ 原文中未找到该原文定位内容（诊断已输出到控制台 F12）');
+      try {
+        console.warn('[QC 对比区定位失败] 原文定位字段(' + String(locateField || '').length + '字):',
+          String(locateField || '').slice(0, 300));
+        console.warn('[QC 对比区定位失败] 原文(' + (o.value || '').length + '字) 开头500字:', (o.value || '').slice(0, 500));
+      } catch (e) { /* 忽略 */ }
+    }
+    // ② 修改后：同样优先用合并标记（黄色高亮与滚动位置同源）；
+    //    手动改过文本导致标记丢失时按 fix 内容重新定位
+    if (m) {
+      // 细粒度标记：一条目多个子标记，取整体区间做选中与滚动
+      const rngMarks = problem ? cmpProblemMarkRange(cmp.mergedMarks, problem) : null;
+      // 兜底重定位时带上顺序提示：该条之前的条目标记结束处之后才开始找，
+      // 相同内容的修改方式不会都匹配到第一处
+      let mHint = 0;
+      if (problem && !rngMarks) {
+        const pOrder = lastProblems.indexOf(problem);
+        for (let i = pOrder - 1; i >= 0; i--) {
+          const prev = cmpProblemMarkRange(cmp.mergedMarks, lastProblems[i]);
+          if (prev) { mHint = prev.end; break; }
+        }
+      }
+      const rngM = rngMarks || (problem ? cmpFindRange(m.value, problem.fix, mHint) : null);
+      if (rngM) {
+        try { m.setSelectionRange(rngM.start, rngM.end); } catch (e) { /* 忽略 */ }
+        scrollToOffset(m, cmp.mirror, rngM.start); // Range 量测精确滚动
+        ok = true;
+      } else if (rngO) {
+        // 修改后里找不到（可能被手动改掉）：按原文当前位置的滚动比例联动，保持两侧对齐
+        const maxO = o.scrollHeight - o.clientHeight;
+        const maxM = m.scrollHeight - m.clientHeight;
+        m.scrollTop = maxO > 0 ? Math.round((o.scrollTop / maxO) * maxM) : 0;
+        if (cmp.mirror) cmp.mirror.scrollTop = m.scrollTop;
+        if (cmp.hl) cmp.hl.scrollTop = m.scrollTop;
+      }
+    }
+    return ok;
+  }
+
+  // 卡片「修改方式」编辑保存后同步：修改后文本 = 原文 + 各条修改方式 的合并产物，
+  // 用 force=true 强制重算（覆盖修改后 textarea 的手工改动）。
+  // 不要求 compareOpen：对比区收起时也要把新合并文本写进 textarea，
+  // 用户重开对比区即可看到最新结果，不会丢失卡片编辑
+  function cmpSyncFixChange() {
+    if (!cmp.modTa) return; // 对比区从未构建过：p.fix 已更新，下次打开会重算，这里不强行建
+    if (cmpEditMode) cmpSetEditMode(false); // 卡片修改方式已更新：退出编辑态，重算合并覆盖
+    cmpRebuildMerged(true);
+  }
+
+  // ── 「修改后」编辑态：默认只读，点「编辑」解锁；编辑中仅 保存/取消（参照「修改方式」就地编辑）──
+  // 编辑期间标记照常由 cmpApplyEditDelta 增量维护；「取消」整体回滚文本与标记
+  function cmpSetEditMode(on) {
+    if (!cmp.modTa) return;
+    if (on) {
+      if (cmpEditMode) return;
+      cmpEditBackup = {
+        text: cmp.modTa.value,
+        mergedMarks: cmp.mergedMarks.map((mk) => ({ start: mk.start, end: mk.end, p: mk.p, t: mk.t })),
+        lastMerged: cmp.lastMerged,
+        lastModText: cmp.lastModText
+      };
+      cmpEditMode = true;
+      qcTrack('对比区编辑', { result: 'start' });
+    } else {
+      cmpEditMode = false;
+      cmpEditBackup = null;
+    }
+    cmp.modTa.readOnly = !cmpEditMode;
+    if (cmp.btnCopy) cmp.btnCopy.style.display = cmpEditMode ? 'none' : '';
+    if (cmp.btnEdit) cmp.btnEdit.style.display = cmpEditMode ? 'none' : '';
+    if (cmp.btnFmt) cmp.btnFmt.style.display = cmpEditMode ? 'none' : '';
+    if (cmp.btnSave) cmp.btnSave.style.display = cmpEditMode ? '' : 'none';
+    if (cmp.btnCancel) cmp.btnCancel.style.display = cmpEditMode ? '' : 'none';
+    if (cmp.modLbl) cmp.modLbl.textContent = cmpEditMode
+      ? '✏️ 修改后（编辑中：保存后生效，「取消」回滚）'
+      : '✏️ 修改后（黄色=替换内容，只读·点「编辑」修改）';
+  }
+
+  function cmpSaveEdit() {
+    if (!cmpEditMode) return;
+    cmpSetEditMode(false);
+    cmpSetStatus('✅ 修改后内容已保存', 'ok');
+    showToast('✅ 已保存');
+    qcTrack('对比区编辑', { result: 'success', len: ((cmp.modTa && cmp.modTa.value) || '').length });
+  }
+
+  function cmpCancelEdit() {
+    if (!cmpEditMode) return;
+    const bk = cmpEditBackup;
+    cmpSetEditMode(false);
+    if (!bk || !cmp.modTa) return;
+    cmp.modTa.value = bk.text;
+    cmp.mergedMarks = bk.mergedMarks;
+    cmp.lastMerged = bk.lastMerged;
+    cmpRepaintModMirror(); // 重绘镜像+高亮，并把 cmp.lastModText 同步为恢复后的文本（增量基准归位）
+    showToast('已取消编辑，恢复到编辑前内容');
+    qcTrack('对比区编辑', { result: 'cancel' });
+  }
+
+  // ══════════════════════════════════════════
+  // 「格式优化」：convert.py（Markdown 启发式修复）的 JS 移植
+  // ══════════════════════════════════════════
+  // 管线与 Python 版一致：repair_markdown → clean_dirty_symbols → fix_markdown
+  //   → txt_to_markdown，迭代至稳定（最多 3 轮）。仅调整「修改后」文本格式，
+  //   不改语义；黄色高亮（mergedMarks）经 cmpBuildCharMap 行级 LCS 字符映射重映射保留，
+  //   原文列（origMarks/原文文本）不受影响。
+
+  function fmtNormalize(t) { return t.replace(/\r\n/g, '\n').replace(/\r/g, '\n'); }
+  // JS 的 string.replace 只换第一处，用 split/join 实现 Python 的全量替换
+  function fmtReplAll(s, from, to) { return s.split(from).join(to); }
+  // 单元格是否为分隔行单元格（空串或仅 - : 组成）
+  function fmtIsSepCellStrict(c) { return c === '' || /^[-:]*$/.test(c); }
+  function fmtIsSepCellSp(c) { return /^[-: ]*$/.test(c); }
+  function fmtIsSepCells(cells) { return cells.every(fmtIsSepCellSp); }
+
+  function fmtLooksLikeHeading(line) {
+    const s = line.trim();
+    if (!s || s.length > 40) return false;
+    if (/^[-*+•·>]/.test(s)) return false;
+    if (/^\d/.test(s) && (s.includes('. ') || s.includes('、') || s.includes(') '))) return false;
+    const last = s[s.length - 1];
+    if ('。.，,；;：:!！?？…·-—()（）"“”{}'.includes(last)) return false;
+    if (s.includes(':') && (s.includes('"') || s.endsWith('{') || s.endsWith('}'))) return false;
+    for (const mk of ['#', '|', '```', '**', '[', ']']) if (s.includes(mk)) return false;
+    return true;
+  }
+
+  // 从 lines[i] 起收集连续的 | 行 / \t 行重建表格；返回 { table, next } 或 null
+  function fmtToTable(lines, i) {
+    let cols = null;
+    const rows = [];
+    let j = i;
+    while (j < lines.length) {
+      const ln = lines[j].trim();
+      if (!ln) break;
+      let cells;
+      if (ln.includes('\t')) {
+        cells = ln.split('\t').map((c) => c.trim());
+      } else if (ln.startsWith('|') && ln.endsWith('|') && (ln.match(/\|/g) || []).length >= 2) {
+        cells = ln.slice(1, -1).split('|').map((c) => c.trim());
+      } else break;
+      if (cells.length && cells.every(fmtIsSepCellStrict)) { j++; continue; }
+      if (cols === null) cols = cells.length;
+      else if (cells.length !== cols) break;
+      rows.push(cells);
+      j++;
+    }
+    if (cols === null || rows.length < 2) return null;
+    const out = ['| ' + rows[0].join(' | ') + ' |',
+      '| ' + Array(cols).fill('---').join(' | ') + ' |'];
+    for (let k = 1; k < rows.length; k++) out.push('| ' + rows[k].join(' | ') + ' |');
+    return { table: out.join('\n'), next: j };
+  }
+
+  function fmtSepRow(ln) {
+    const body = ln.trim();
+    if (!(body.startsWith('|') && body.endsWith('|'))) return false;
+    const cells = body.slice(1, -1).split('|');
+    return cells.length > 0 && cells.every(fmtIsSepCellSp);
+  }
+
+  function fmtNormTableRegion(rows) {
+    const parsed = rows.map((r) => r.trim().replace(/^\|+/, '').replace(/\|+$/, '')
+      .split('|').map((c) => c.trim()));
+    const data = parsed.filter((c) => !fmtIsSepCells(c));
+    const colmax = data.reduce((m, c) => Math.max(m, c.length), 0);
+    if (colmax < 2) return null;
+    const sepRow = '| ' + Array(colmax).fill('---').join(' | ') + ' |';
+    const out = [];
+    let seen = false;
+    for (const cells of parsed) {
+      if (fmtIsSepCells(cells)) {
+        if (seen && (!out.length || out[out.length - 1] !== sepRow)) out.push(sepRow);
+        else if (!seen) out.push(sepRow);
+        continue;
+      }
+      const pad = cells.concat(Array(colmax).fill('')).slice(0, colmax);
+      out.push('| ' + pad.join(' | ') + ' |');
+      seen = true;
+    }
+    return out;
+  }
+
+  function fmtIsCleanTable(region) {
+    if (!region || !region.every((r) => r.startsWith('|') && r.endsWith('|'))) return false;
+    if (new Set(region.map((r) => (r.match(/\|/g) || []).length)).size !== 1) return false;
+    for (const r of region) {
+      const cells = r.slice(1, -1).split('|').map((c) => c.trim());
+      if (fmtIsSepCells(cells) && !cells.filter((c) => c !== '').every(fmtIsSepCellStrict)) return false;
+    }
+    return true;
+  }
+
+  function fmtLastDataRow(region) {
+    for (let idx = region.length - 1; idx >= 0; idx--) {
+      if (region[idx].startsWith('|') && !fmtSepRow(region[idx])) return idx;
+    }
+    return -1;
+  }
+
+  function fmtRepairTables(text) {
+    const lines = text.split('\n');
+    const out = [];
+    let i = 0;
+    const n = lines.length;
+    while (i < n) {
+      const s = lines[i].trim();
+      if (s.includes('|') && s.startsWith('|')) {
+        const region = [];
+        let j = i, prevCont = false, blank = false;
+        while (j < n) {
+          const lj = lines[j].trim();
+          if (!lj) { blank = true; j++; continue; }
+          if (lj.startsWith('|')) {
+            if (blank && !prevCont) break;
+            region.push(lj);
+            prevCont = fmtIsSepCells(lj.slice(1, -1).split('|').map((c) => c.trim()));
+            blank = false; j++; continue;
+          }
+          if (lj.startsWith('-') && /^[-|: ]*$/.test(lj)) {
+            region.push('| --- |'); prevCont = true; blank = false; j++; continue;
+          }
+          const isCont = (lj.endsWith('|') && !lj.startsWith('|') && !lj.startsWith('- ')
+              && !lj.startsWith('* ') && !lj.startsWith('+ ')) || lj.startsWith('、');
+          if (isCont) {
+            const content = lj.replace(/\|+$/, '').trim();
+            const didx = fmtLastDataRow(region);
+            if (didx >= 0) region[didx] = region[didx].slice(0, -1).replace(/\s+$/, '') + ' ' + content + ' |';
+            else region.push('| ' + content + ' |');
+            prevCont = true; blank = false; j++; continue;
+          }
+          break;
+        }
+        if (fmtIsCleanTable(region)) { for (const r of region) out.push(r); i = j; continue; }
+        const built = fmtNormTableRegion(region);
+        if (built && built.length) { for (const r of built) out.push(r); i = j; continue; }
+      }
+      out.push(lines[i]);
+      i++;
+    }
+    return out.join('\n');
+  }
+
+  function fmtRepairMarkdown(text) {
+    text = fmtReplAll(fmtReplAll(fmtReplAll(text, '\\n', '\n'), '\\r', '\n'), '\\"', '"');
+    text = fmtReplAll(text, '\\t', ' ');
+    text = fmtRepairTables(text);
+    const cleaned = [];
+    for (const ln of text.split('\n')) {
+      const s = ln.trim();
+      if (/^#{1,6}$/.test(s)) { cleaned.push('---'); continue; }
+      if (['-', '|', '- |', '| -', '---', '>'].includes(s)) { cleaned.push('---'); continue; }
+      if (s.length >= 2 && fmtIsSepCellSp(s)) { cleaned.push('---'); continue; }
+      cleaned.push(ln);
+    }
+    return cleaned.join('\n');
+  }
+
+  function fmtCleanDirty(text) {
+    const out = [];
+    for (let s of text.split('\n')) {
+      s = s.replace(/^(\s*[-*+]\s*)\[[ xX]\]\s*/, '$1');
+      s = s.replace(/^」/, '');
+      s = fmtReplAll(s, '**」', '**');
+      s = s.replace(/^#\s*(\|)/, '$1');
+      // □/☐/� 及私用区字符（U+E000-U+F8FF）是 PDF/Word/图标字体复制残留的乱码方块，
+      // 按脏数据从行内删除；如只需删 □，把字符类改为 /[□]/g 即可
+      s = s.replace(/[\u25a1\u2610\ufffd\uE000-\uF8FF]/g, ''); // 乱码方块/私用区脏字符
+      const t = s.trim();
+      if (t && /^[；;。，,、：:?？!！…·—・]*$/.test(t)) continue;
+      if (s.startsWith('、') && out.length && out[out.length - 1].trim()
+          && out[out.length - 1].trim() !== '|') {
+        out[out.length - 1] = out[out.length - 1].replace(/\s+$/, '') + s;
+        continue;
+      }
+      out.push(s);
+    }
+    const result = [];
+    for (const ln of out) {
+      if (fmtSepRow(ln) && result.length && fmtSepRow(result[result.length - 1])) continue;
+      result.push(ln);
+    }
+    return result.join('\n');
+  }
+
+  function fmtFixMarkdown(md) {
+    let text = fmtNormalize(md);
+    text = text.replace(/^(#{1,6})[ \t]{2,}(?=\S)/gm, '$1 ');
+    text = text.replace(/^([ \t]*)(#{1,6})([^\s#])/gm, '$1$2 $3');
+    text = text.replace(/^(\s*)[*•·]\s+(?=\S)/gm, '$1- ');
+    text = text.replace(/^(\s*)(\d+)\s*[)、(）)][ \t]*(?=\S)/gm, '$1$2. ');
+    text = text.replace(/^(\s*)([-+*])(?=[^\s\-+*])/gm, '$1$2 ');
+    text = fmtReplAll(fmtReplAll(fmtReplAll(fmtReplAll(fmtReplAll(fmtReplAll(text,
+      '** ', '**'), ' **', '**'), '__ ', '__'), ' __', '__'), '**　', '**'), '　**', '**');
+    text = text.replace(/\[\s*([^\]\n]+?)\s*\]\s*\(\s*([^)\n]+?)\s*\)/g,
+      (m, a, b) => '[' + a.trim() + '](' + b.trim() + ')');
+    let fences = 0;
+    for (const ln of text.split('\n')) if (ln.trim().startsWith('```')) fences++;
+    if (fences % 2 === 1) text = text.replace(/\s+$/, '') + '\n```\n';
+    text = text.replace(/^```[ \t]+(?=\S)/gm, '``` ');
+    text = text.replace(/\n{3,}/g, '\n\n');
+    text = text.split('\n').map((l) => l.replace(/\s+$/, '')).join('\n');
+    return text.replace(/^\s+|\s+$/g, '') + '\n';
+  }
+
+  function fmtStripLines(text) {
+    return fmtNormalize(text).split('\n').map((l) => l.replace(/\s+$/, ''));
+  }
+
+  function fmtTxtToMarkdown(text) {
+    const lines = fmtStripLines(text);
+    while (lines.length && !lines[0].trim()) lines.shift();
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const ln = lines[i].trim();
+      if (!ln) {
+        if (out.length && out[out.length - 1] !== '') out.push('');
+        i++; continue;
+      }
+      if (ln.length >= 3 && /^[-=*_~ ]*$/.test(ln)
+          && (ln.match(/-/g) || []).length >= 3 && !ln.startsWith('```')) {
+        if (out.length && out[out.length - 1] !== '') out.push('');
+        out.push('---'); out.push('');
+        i++; continue;
+      }
+      if (ln.startsWith('|') && ln.endsWith('|') && (ln.match(/\|/g) || []).length >= 2) {
+        const region = [];
+        let j = i;
+        while (j < lines.length) {
+          const t = lines[j].trim();
+          if (t.startsWith('|') && t.endsWith('|')) { region.push(t); j++; } else break;
+        }
+        if (region.length >= 2 && fmtIsCleanTable(region)) {
+          if (out.length && out[out.length - 1] !== '') out.push('');
+          for (const r of region) out.push(r);
+          out.push('');
+          i = j; continue;
+        }
+      }
+      const tbl = fmtToTable(lines, i);
+      if (tbl !== null) {
+        if (out.length && out[out.length - 1] !== '') out.push('');
+        out.push(tbl.table); out.push('');
+        i = tbl.next; continue;
+      }
+      if (ln.startsWith('```')) { out.push(ln); i++; continue; }
+      let m = ln.match(/^(\d{1,3})[.、)）][ \t]*(.+)$/);
+      if (m && m[2]) { out.push(m[1] + '. ' + m[2]); i++; continue; }
+      m = ln.match(/^(?:[-+•·]|\* )[ \t]*(.+)$/);
+      if (m && m[1]) { out.push('- ' + m[1]); i++; continue; }
+      m = ln.match(/^([^：:]{1,20})\s*[：:]\s*(.+)$/);
+      if (m && m[2] && !/^http/.test(m[1]) && !m[1].startsWith('#')
+          && !/[*#[\]`~_|<>!]/.test(m[1])) {
+        out.push('**' + m[1] + '**：' + m[2]);
+        i++; continue;
+      }
+      if (fmtLooksLikeHeading(ln)) {
+        const prevBlank = (i === 0) || !lines[i - 1].trim();
+        const nextBlank = (i === lines.length - 1) || !lines[i + 1].trim();
+        if (prevBlank || nextBlank) {
+          if (out.length && out[out.length - 1] !== '') out.push('');
+          out.push('### ' + ln); out.push('');
+          i++; continue;
+        }
+      }
+      out.push(ln);
+      i++;
+    }
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\s+|\s+$/g, '') + '\n';
+  }
+
+  function fmtRunOnce(text) {
+    let t = fmtRepairMarkdown(text);
+    t = fmtCleanDirty(t);
+    t = fmtFixMarkdown(t);
+    t = fmtTxtToMarkdown(t);
+    return t.replace(/\n{3,}/g, '\n\n').replace(/^\s+|\s+$/g, '') + '\n';
+  }
+
+  // 与 convert.py smart_process 一致：迭代至稳定（最多 3 轮）
+  function fmtSmartProcess(text) {
+    let result = fmtRunOnce(text);
+    for (let k = 0; k < 3; k++) {
+      const nxt = fmtRunOnce(result);
+      if (nxt === result) break;
+      result = nxt;
+    }
+    return result;
+  }
+
+  // ── 高亮保留：行单元（含行尾换行）LCS 对齐 → 旧偏移→新偏移映射（0..oldLen 全覆盖、单调）──
+  function cmpLineUnits(t) {
+    const ls = t.split('\n');
+    return ls.map((l, k) => (k < ls.length - 1 ? l + '\n' : l));
+  }
+
+  function cmpBuildCharMap(oldT, newT) {
+    const oU = cmpLineUnits(oldT);
+    const nU = cmpLineUnits(newT);
+    const A = oU.length, B = nU.length;
+    const oS = [0], nS = [0];
+    for (let k = 0; k < A; k++) oS.push(oS[k] + oU[k].length);
+    for (let k = 0; k < B; k++) nS.push(nS[k] + nU[k].length);
+    const map = new Array(oldT.length + 1);
+    const matches = [];
+    if (A * B <= 4000000) {
+      const W = B + 1;
+      const dp = new Int32Array((A + 1) * W);
+      for (let i2 = A - 1; i2 >= 0; i2--) {
+        for (let j2 = B - 1; j2 >= 0; j2--) {
+          dp[i2 * W + j2] = oU[i2] === nU[j2]
+            ? dp[(i2 + 1) * W + j2 + 1] + 1
+            : Math.max(dp[(i2 + 1) * W + j2], dp[i2 * W + j2 + 1]);
+        }
+      }
+      let i2 = 0, j2 = 0;
+      while (i2 < A && j2 < B) {
+        if (oU[i2] === nU[j2]) { matches.push([i2, j2]); i2++; j2++; }
+        else if (dp[(i2 + 1) * W + j2] >= dp[i2 * W + j2 + 1]) i2++;
+        else j2++;
+      }
+    }
+    // 未匹配行组：整组字符串按公共前缀/后缀对齐，被删内容映射到改动核心起点
+    const emitGap = (oFrom, oTo, nFrom, nTo) => {
+      if (oFrom >= oTo && nFrom >= nTo) return;
+      const go = oldT.slice(oS[oFrom], oS[oTo]);
+      const gn = newT.slice(nS[nFrom], nS[nTo]);
+      const lo = go.length, lnn = gn.length;
+      const minL = Math.min(lo, lnn);
+      let p = 0;
+      while (p < minL && go[p] === gn[p]) p++;
+      let sf = 0;
+      while (sf < minL - p && go[lo - 1 - sf] === gn[lnn - 1 - sf]) sf++;
+      for (let k = 0; k < p; k++) map[oS[oFrom] + k] = nS[nFrom] + k;
+      for (let k = p; k < lo - sf; k++) map[oS[oFrom] + k] = nS[nFrom] + p;
+      for (let k = 0; k < sf; k++) map[oS[oFrom] + lo - sf + k] = nS[nFrom] + lnn - sf + k;
+      if (oTo <= A) map[oS[oTo]] = nS[nTo];
+    };
+    let oi = 0, ni = 0;
+    for (const pr of matches) {
+      if (pr[0] > oi || pr[1] > ni) emitGap(oi, pr[0], ni, pr[1]);
+      for (let k = 0; k < oU[pr[0]].length; k++) map[oS[pr[0]] + k] = nS[pr[1]] + k;
+      map[oS[pr[0]] + oU[pr[0]].length] = nS[pr[1]] + oU[pr[0]].length;
+      oi = pr[0] + 1; ni = pr[1] + 1;
+    }
+    if (oi < A || ni < B) emitGap(oi, A, ni, B);
+    let last = 0;
+    for (let k = 0; k <= oldT.length; k++) {
+      const v = map[k];
+      if (typeof v === 'number' && v >= 0) last = v;
+      else map[k] = last;
+    }
+    for (let k = 1; k <= oldT.length; k++) if (map[k] < map[k - 1]) map[k] = map[k - 1];
+    map[oldT.length] = newT.length;
+    return map;
+  }
+
+  // 区间端点过映射；防退化：原区间非空则至少保留 1 字高亮
+  function cmpRemapRange(r, map, newLen) {
+    let ns = map[Math.max(0, Math.min(r.s, map.length - 1))];
+    let ne = map[Math.max(0, Math.min(r.e, map.length - 1))];
+    if (ne < ns) { const tmp = ns; ns = ne; ne = tmp; }
+    ns = Math.max(0, Math.min(ns, newLen));
+    ne = Math.max(0, Math.min(ne, newLen));
+    if (ne <= ns && r.e > r.s) ne = Math.min(newLen, ns + 1);
+    return { s: ns, e: ne };
+  }
+
+  // ⚡ 格式优化：按 convert.py 规则优化「修改后」格式，重映射黄色高亮（mergedMarks）
+  // 原文列（origMarks）坐标在原文文本上，不受修改后格式化影响，无需处理
+  function cmpFormatOptimize() {
+    if (!cmp.modTa) return;
+    const before = cmp.modTa.value;
+    if (!before || !before.trim()) { showToast('⚠️ 修改后暂无内容'); return; }
+    if (cmpEditMode) { showToast('⚠️ 编辑中请先保存或取消'); return; }
+    const after = fmtSmartProcess(before);
+    if (after === before) { showToast('✅ 格式已规范，无需优化'); return; }
+    const map = cmpBuildCharMap(before, after);
+    cmp.mergedMarks = cmp.mergedMarks
+      .map((mk) => {
+        const nr = cmpRemapRange({ s: mk.start, e: mk.end }, map, after.length);
+        // 自检基准 t：映射后内容与原标记内容一致才保留，否则弃用（保证数据抽样自检不误报）
+        const nt = after.slice(nr.s, nr.e);
+        return { start: nr.s, end: nr.e, p: mk.p,
+          t: (typeof mk.t === 'string' && nt === mk.t) ? mk.t : undefined };
+      })
+      .filter((mk) => mk.end > mk.start);
+    cmp.modTa.value = after;
+    cmpRepaintModMirror(); // 重绘镜像+高亮，cmp.lastModText 同步为新文本（编辑增量基准）
+    cmpSetStatus('⚡ 格式优化完成 · ' + before.length + ' 字 → ' + after.length +
+      ' 字（黄色高亮已按新位置保留）', 'ok');
+    showToast('⚡ 已按 Markdown 规范优化格式，高亮已保留');
+    qcTrack('对比区格式优化', { result: 'success', before: before.length, after: after.length });
+  }
+
   // 面板关闭后重新打开时，输入框里的提示词已不在内存中——
   // 改从 Agent 聊天区读取最后一条「用户发出的气泡」文本（即用户发送的提示词，
   // 含质检规则原文）作为质检点/业务线识别的权威来源
@@ -2086,7 +3489,7 @@
       position: 'fixed', top: '0', right: '0', bottom: '0',
       width: 'min(560px, 72vw)',
       background: '#f4f6f9', boxShadow: '-4px 0 24px rgba(0,0,0,0.18)',
-      zIndex: '99999', display: 'flex', flexDirection: 'column',
+      zIndex: '99999', display: 'flex', flexDirection: 'row',
       fontFamily: FONT,
       animation: 'qcSlideLeft 0.25s ease'
     });
@@ -2102,7 +3505,7 @@
     const title = document.createElement('span');
     title.id = 'qc-panel-title';
     title.style.cssText = 'font-weight:700;font-size:15px;color:#fff;flex:1';
-    title.textContent = '🤖 质检助手';
+    title.textContent = '🤖 质检助手 v5.4.8'; // 版本号入 UI：重载插件后打开面板即可肉眼确认新旧代码
 
     const actions = document.createElement('div');
     actions.id = 'qc-panel-actions';
@@ -2141,7 +3544,13 @@
     body.id = 'qc-panel-body';
     body.style.cssText = 'flex:1;overflow:auto;padding:14px 14px 24px;box-sizing:border-box';
 
-    panel.appendChild(head);
+    // ── 左侧原文对比扩展区（默认收起）+ 右侧主列（头/Tab/正文）──
+    panel.appendChild(buildCompareWrap());
+    const mainCol = document.createElement('div');
+    mainCol.id = 'qc-main-col';
+    panel.appendChild(mainCol);
+
+    mainCol.appendChild(head);
 
     // ── 模式切换 Tab 条（A 对话优化 / C 评测集生成）──
     const modeBar = document.createElement('div');
@@ -2153,9 +3562,18 @@
       t.addEventListener('click', () => switchPanelMode(name));
       modeBar.appendChild(t);
     });
-    panel.appendChild(modeBar);
+    mainCol.appendChild(modeBar);
 
-    panel.appendChild(body);
+    mainCol.appendChild(body);
+
+    // ── 左缘扩展箭头：展开/收起原文对比区 ──
+    const cmpTab = document.createElement('button');
+    cmpTab.id = 'qc-compare-tab';
+    cmpTab.type = 'button';
+    cmpTab.textContent = '⇤ 原文对比';
+    cmpTab.title = '展开原文对比区（规则原文 vs 修改后）';
+    cmpTab.addEventListener('click', () => setCompareOpen(!compareOpen));
+    panel.appendChild(cmpTab);
 
     // ── 右下角缩放手柄：拖拽可调整宽度/高度 ──
     const resizeHandle = document.createElement('div');
@@ -2170,6 +3588,13 @@
     document.body.appendChild(panel);
     panelEl = panel;
     panelCollapsed = false;
+    compareOpen = false; // 面板重建后对比区默认收起（tab 文案/面板宽度状态保持一致）
+    // 清掉上一轮面板残留的标记/快照状态（原文 cmp.original 与 autoKey 保留，
+    // 下次展开时按当前 lastProblems 重新合并，避免旧标记配到新 textarea 的内容上造成偏移）
+    cmp.mergedMarks = [];
+    cmp.origMarks = [];
+    cmp.lastMerged = '';
+    cmp.lastModText = '';
 
     const bodyEl = panel.querySelector('#qc-panel-body');
     if (bodyEl) renderBody(bodyEl); // 初始渲染（按当前模式分派）
@@ -2190,8 +3615,8 @@
   function startPanelDrag(e) {
     const panel = panelEl;
     if (!panel || e.button !== 0) return;
-    // 不拦截按钮/输入框/Tab 等交互元素
-    if (e.target.closest && e.target.closest('button, input, select, textarea, .qc-mode-tab')) return;
+    // 不拦截按钮/输入框/Tab/对比区等交互元素
+    if (e.target.closest && e.target.closest('button, input, select, textarea, .qc-mode-tab, #qc-compare-wrap')) return;
     const isFloating = panel.dataset.floatMode === '1';
     if (!isFloating) {
       const r = panel.getBoundingClientRect();
@@ -2366,11 +3791,11 @@
     }
     ensureFloatButton();
     startSelfHeal();
-    console.log('[QC 提取器 v4.17.23] 已就绪');
+    console.log('[QC 提取器 v5.4.8-keephl] 已就绪');
   }
 
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();
 })();
-1
+
