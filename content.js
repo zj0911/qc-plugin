@@ -57,6 +57,9 @@
   // 「修改后」工具条状态：一键复制 / 编辑(→保存·取消) / 格式优化
   let cmpEditMode = false;   // 修改后是否处于编辑态（默认只读，点「编辑」解锁）
   let cmpEditBackup = null;  // 进入编辑前快照 {text, mergedMarks, lastMerged, lastModText}，取消时回滚
+  // 已采纳的修改方式条目集合（对象引用 = lastProblems 里的 p）：
+  // cmpBuildMerged 只替换集合内的条目；新一轮解析/重载会整体换掉 lastProblems，需同步 clear
+  const cmpAdopted = new Set();
 
   // 标记兼容 1~4 级标题：Agent 输出偶尔用「# 优化结果」单井号变体
   const MARKER_PATTERN = /#{1,4}\s*优化结果/;
@@ -1065,30 +1068,19 @@
         // 与原文定位的差异部分加粗展示（复制仍用原始纯文本 p.fix）
         '<div class="qc-detail-body">' + diffBoldHtml(p.fix, p.locate) + '</div>';
       const bodyEl = row.querySelector('.qc-detail-body');
-      // 每条修改方式右上角的复制按钮：只复制本条修改方式文本
-      const copyFixBtn = document.createElement('button');
-      copyFixBtn.type = 'button';
-      copyFixBtn.className = 'qc-fix-copy-btn';
-      copyFixBtn.textContent = '📋 复制';
-      copyFixBtn.addEventListener('click', (e) => {
+      // 每条修改方式右上角的采纳按钮：点击把该条「修改方式」替换进对比区「修改后」（绿色高亮）
+      const adoptFixBtn = document.createElement('button');
+      adoptFixBtn.type = 'button';
+      adoptFixBtn.className = 'qc-fix-adopt-btn' + (cmpAdopted.has(p) ? ' qc-adopted' : '');
+      adoptFixBtn.textContent = cmpAdopted.has(p) ? '↩ 取消采纳' : '✅ 采纳';
+      adoptFixBtn.title = cmpAdopted.has(p)
+        ? '已采纳：该条修改方式已替换进「修改后」（绿色高亮）。再次点击取消采纳'
+        : '采纳该条修改：按「原文定位」把本条修改方式替换进对比区「修改后」，替换内容绿色高亮';
+      adoptFixBtn.addEventListener('click', (e) => {
         e.stopPropagation();
-        navigator.clipboard.writeText(p.fix).then(() => {
-          copyFixBtn.textContent = '✅ 已复制';
-          setTimeout(() => (copyFixBtn.textContent = '📋 复制'), 1500);
-          qcTrack('优化结果复制', { result: 'success', reply_len: (p.fix || '').length, biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
-        }).catch(() => { showToast('❌ 复制失败'); qcTrack('优化结果复制', { result: 'fail', error_code: 'clipboard', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' }); });
+        adoptFix(p, adoptFixBtn);
       });
-      // 编辑按钮：就地微调修改方式文本；保存后 p.fix 更新，复制/重渲染都用新内容
-      const editFixBtn = document.createElement('button');
-      editFixBtn.type = 'button';
-      editFixBtn.className = 'qc-fix-edit-btn';
-      editFixBtn.textContent = '✏️ 编辑';
-      editFixBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        openFixEditor(row, bodyEl, p, copyFixBtn, editFixBtn);
-      });
-      row.appendChild(copyFixBtn);
-      row.appendChild(editFixBtn);
+      row.appendChild(adoptFixBtn);
       list.appendChild(row);
     }
 
@@ -1096,56 +1088,48 @@
     return card;
   }
 
-  // 修改方式就地编辑：正文切换为 textarea + 保存/取消；
-  // 保存后直接改写 p.fix（lastProblems 里的对象引用），复制按钮与后续重渲染同步生效
-  function openFixEditor(row, bodyEl, p, copyBtn, editBtn) {
-    if (row.classList.contains('qc-fix-editing')) return;
-    row.classList.add('qc-fix-editing');
-    copyBtn.style.display = 'none';
-    editBtn.style.display = 'none';
-
-    const ta = document.createElement('textarea');
-    ta.className = 'qc-fix-edit-ta';
-    ta.value = p.fix || '';
-    const bar = document.createElement('div');
-    bar.className = 'qc-fix-edit-bar';
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'button';
-    saveBtn.className = 'qc-fix-edit-save';
-    saveBtn.textContent = '💾 保存';
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.className = 'qc-fix-edit-cancel';
-    cancelBtn.textContent = '取消';
-    bar.appendChild(saveBtn);
-    bar.appendChild(cancelBtn);
-
-    bodyEl.innerHTML = '';
-    bodyEl.appendChild(ta);
-    bodyEl.appendChild(bar);
-    ta.focus();
-
-    const close = () => {
-      row.classList.remove('qc-fix-editing');
-      copyBtn.style.display = '';
-      editBtn.style.display = '';
-      // 与卡片初始渲染一致：差异部分加粗展示
-      bodyEl.innerHTML = diffBoldHtml(p.fix, p.locate);
-    };
-    saveBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const v = ta.value.trim();
-      if (v) p.fix = v;
-      cmpSyncFixChange(); // 修改后文本 = 原文+修改方式 的合并产物，重算合并即同步
-      close();
-      showToast('✅ 修改方式已更新');
-      qcTrack('优化规则编辑', { result: 'success', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
-    });
-    cancelBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      close();
-      qcTrack('优化规则编辑', { result: 'fail', reason: 'cancel', biz: p.qcBizLine || '', qp: (p.qcRefs && p.qcRefs[0]) || '' });
-    });
+  // 采纳/取消采纳一条修改方式：
+  // 采纳 → 该条进入 cmpAdopted 集合，强制重算合并（cmpBuildMerged 只替换已采纳条目），
+  //        「修改后」中对应原文段落被替换为本条修改方式文本，替换内容走修改后列绿色高亮；
+  // 取消 → 移出集合重算，该条恢复为原文，绿色高亮随之消失。
+  // 手动编辑保护：用户改过「修改后」时先 confirm，避免重算悄悄覆盖手工内容
+  function adoptFix(p, btn) {
+    const adopt = !cmpAdopted.has(p);
+    const biz = p.qcBizLine || '', qp = (p.qcRefs && p.qcRefs[0]) || '';
+    // 无原文：展开对比区并自动带参获取（cmpAutoFetch），本次不执行采纳
+    if (!cmp.original) {
+      setCompareOpen(true);
+      showToast('⚠️ 原文尚未获取，已展开「原文对比」自动获取，稍后请重新点击采纳');
+      qcTrack('修改方式采纳', { result: 'fail', reason: 'no_original', action: adopt ? 'adopt' : 'unadopt', biz, qp });
+      return;
+    }
+    // 预检定位：与 cmpBuildMerged 同一判定（score ≥ 0.5），提前拦截无法替换的条目
+    if (adopt) {
+      const r = cmpFindRange(cmp.original, p.locate || '');
+      if (!r || r.end <= r.start || r.score < 0.5) {
+        showToast('⚠️ 未能在原文中定位该条（相似度过低），无法采纳');
+        qcTrack('修改方式采纳', { result: 'fail', reason: 'not_located', action: 'adopt', biz, qp });
+        return;
+      }
+    }
+    // 手动编辑保护：修改后 ≠ 最近合并产出 → 重算会覆盖手工内容，先确认
+    if (cmp.modTa && cmp.lastMerged && cmp.modTa.value !== cmp.lastMerged) {
+      if (!confirm('「修改后」已被手动编辑，' + (adopt ? '采纳' : '取消采纳') + '将按原文重新生成（手动修改会丢失）。是否继续？')) return;
+    }
+    if (adopt) cmpAdopted.add(p); else cmpAdopted.delete(p);
+    const m = cmpRebuildMerged(true); // force：采纳是显式操作，用最新集合重算并覆盖
+    // 按钮态就地切换（不整卡重渲染，避免滚动位置跳动）
+    btn.classList.toggle('qc-adopted', adopt);
+    btn.textContent = adopt ? '↩ 取消采纳' : '✅ 采纳';
+    btn.title = adopt
+      ? '已采纳：该条修改方式已替换进「修改后」（绿色高亮）。再次点击取消采纳'
+      : '采纳该条修改：按「原文定位」把本条修改方式替换进对比区「修改后」，替换内容绿色高亮';
+    const done = m ? m.applied : 0, total = m ? m.total : 0;
+    cmpSetStatus(adopt
+      ? '✅ 已采纳 ' + done + '/' + total + ' 条 · 「修改后」绿色为替换内容'
+      : '↩ 已取消采纳，剩 ' + done + '/' + total + ' 条', 'ok');
+    showToast(adopt ? '✅ 已采纳该条修改（替换内容绿色高亮）' : '↩ 已取消该条采纳');
+    qcTrack('修改方式采纳', { result: 'success', action: adopt ? 'adopt' : 'unadopt', adopted: done, total, biz, qp });
   }
 
   function bindLocateButtons(root) {
@@ -1789,6 +1773,7 @@
       lastExtracted = '';
       lastRcaText = '';
       rcaReviewDeadline = 0;
+      cmpAdopted.clear(); // 新一轮开始：采纳状态一并清空
       cmpResetContent(); // 新一轮开始：清空对比区（上一轮原文/修改后不串场）
       // 取消上一轮遗留的自动刷新定时器，避免新一轮等待期间拿旧内容重渲染
       if (autoRefreshTimer) { clearTimeout(autoRefreshTimer); autoRefreshTimer = null; }
@@ -2059,6 +2044,7 @@
       const problems = structureProblems(result, promptCtx);
       if (problems.length) {
         lastExtracted = result;
+        cmpAdopted.clear(); // 新解析对象替换旧条目：采纳状态失效，同步清空
         lastProblems = problems;
         setChatStatus('✅ 格式化完成', 'ok');
         rerenderExtractBody();
@@ -2085,6 +2071,7 @@
 
     if (problems.length) {
       lastExtracted = refined || norm;
+      cmpAdopted.clear(); // 新解析对象替换旧条目：采纳状态失效，同步清空
       lastProblems = problems;
       setChatStatus('✅ 格式化完成', 'ok');
       rerenderExtractBody();
@@ -2165,6 +2152,7 @@
       // 静默路线：页面内容与上次一致说明没有新的完整回复，不动状态也不重渲染
       if (silent && result === lastExtracted) return 'unchanged';
       lastExtracted = result;
+      cmpAdopted.clear(); // 重载重新解析：条目对象全新，采纳状态失效
       lastProblems = problems;
       setChatStatus('✅ ' + (silent ? '自动' : '已') + '重新加载格式（' + problems.length + ' 条）', 'ok');
       rerenderExtractBody();
@@ -2221,11 +2209,10 @@
   // 5.5 原文对比（左侧扩展区）
   //   左列：规则原文（只读，页面接口抓取）｜右列：修改后（默认只读，「编辑」解锁，与原文差异高亮）
   //   原文滚动 → 修改后按比例同步滚动；卡片「定位原文」在两个 textarea 内选中定位；
-  //   修改后编辑 → 防抖重解析同步到卡片；卡片修改方式编辑 → 反向同步进 textarea
+  //   卡片「采纳」→ 该条修改方式替换进修改后（绿色高亮），取消采纳恢复原文
   // ══════════════════════════════════════════
 
   // 「修改后」列工具条：一键复制 / 编辑(→保存·取消) / 格式优化
-  // 编辑交互参照卡片「修改方式」就地编辑（openFixEditor）：编辑时隐藏其余按钮，只留 保存/取消
   // 面板重建会重新调用 → 在此复位编辑态，避免旧态残留把新 textarea 锁死
   function buildModToolbar() {
     cmpEditMode = false;
@@ -2461,6 +2448,7 @@
     cmpSetEditMode(false); // 新一轮开始：退出编辑态，避免清空后仍停留在编辑中
     cmp.original = '';
     cmp.autoKey = '';
+    cmpAdopted.clear(); // 对比区清空：采纳状态一并重置
     cmp.mergedMarks = [];
     cmp.origMarks = [];
     cmp.lastMerged = '';
@@ -2540,7 +2528,7 @@
         cmp.autoKey = qp + '|' + biz + '|' + ver; // 记录已成功获取的条件（自动获取去重用）
         // 核心合并：把各条目的「修改方式」按「原文定位」替换进原文，生成修改后全文
         const m = cmpRebuildMerged();
-        cmpSetStatus('✅ 原文已加载', 'ok');
+        cmpSetStatus('✅ 原文已加载 · 点击卡片「✅ 采纳」把修改方式替换到「修改后」（绿色高亮）', 'ok');
         qcTrack('原文对比获取', { result: 'success', qp, biz, ver, len: cmp.original.length, merged: m ? m.applied : 0 });
       } else {
         cmpSetStatus('❌ ' + ((resp && resp.hint) || (resp && resp.error) || '获取失败'), 'err');
@@ -2607,15 +2595,18 @@
     return e > s ? { start: s, end: e } : null;
   }
 
-  // ══════════ 核心合并：原文定位 → 修改方式替换 ══════════
-  // 把每条问题的「修改方式」按其「原文定位」在原文中找到位置并替换，
+  // ══════════ 核心合并：原文定位 → 修改方式替换（逐条采纳制）══════════
+  // 只把「已采纳」（cmpAdopted 集合内）问题的「修改方式」按其「原文定位」在原文中找到位置并替换，
   // 产出修改后全文 + 两侧高亮区间（差异细粒度：只标真正变化的子段，等价卡片差异加粗）：
-  //   mergedMarks：修改后文本中新增的变化子段（黄色高亮，一条修改可对应多个子段）
-  //   origMarks  ：原文文本中被删除/替换的变化子段（橙色高亮）
-  // 未定位到原文位置的条目跳过（不强行拼接），数量由调用方在状态条提示
+  //   mergedMarks：修改后文本中替换进来的内容（修改后列绿色高亮，一条修改可对应多个子段）
+  //   origMarks  ：原文文本中被删除/替换的变化子段（原文列蓝色高亮）
+  // 未采纳的条目不替换（修改后 = 原文）；未定位到原文位置的条目跳过（不强行拼接），
+  // 数量由调用方在状态条提示
   function cmpBuildMerged() {
     const orig = cmp.original || '';
-    const probs = lastProblems.filter((p) => p.locate && p.fix);
+    // 逐条采纳制：只替换用户点过「采纳」的条目（cmpAdopted 内的对象引用），
+    // 未采纳条目保持原文不动；集合为空时修改后 = 原文
+    const probs = lastProblems.filter((p) => p.locate && p.fix && cmpAdopted.has(p));
     const hits = [];
     for (const p of probs) {
       const r = cmpFindRange(orig, p.locate);
@@ -2705,7 +2696,9 @@
     if (!force && cmp.modTa.value !== cmp.lastMerged && cmp.lastMerged) {
       cmpRepaintOrigMirror();
       cmpRepaintModMirror();
-      return { applied: new Set(cmp.mergedMarks.map((x) => x.p)).size, total: lastProblems.filter((p) => p.locate && p.fix).length };
+      // 逐条采纳制：total 与 applied 均按「已采纳且可定位」口径统计
+      const adoptables = lastProblems.filter((p) => p.locate && p.fix && cmpAdopted.has(p)).length;
+      return { applied: new Set(cmp.mergedMarks.map((x) => x.p)).size, total: adoptables };
     }
     cmp.origTa.value = cmp.original;
     const m = cmpBuildMerged();
@@ -3140,16 +3133,6 @@
       }
     }
     return ok;
-  }
-
-  // 卡片「修改方式」编辑保存后同步：修改后文本 = 原文 + 各条修改方式 的合并产物，
-  // 用 force=true 强制重算（覆盖修改后 textarea 的手工改动）。
-  // 不要求 compareOpen：对比区收起时也要把新合并文本写进 textarea，
-  // 用户重开对比区即可看到最新结果，不会丢失卡片编辑
-  function cmpSyncFixChange() {
-    if (!cmp.modTa) return; // 对比区从未构建过：p.fix 已更新，下次打开会重算，这里不强行建
-    if (cmpEditMode) cmpSetEditMode(false); // 卡片修改方式已更新：退出编辑态，重算合并覆盖
-    cmpRebuildMerged(true);
   }
 
   // ── 「修改后」编辑态：默认只读，点「编辑」解锁；编辑中仅 保存/取消（参照「修改方式」就地编辑）──
@@ -3616,6 +3599,7 @@
     if (panelEl) panelEl.remove();
 
     lastExtracted = content;
+    cmpAdopted.clear(); // 面板重建重新解析：条目对象全新，采纳状态失效
     lastProblems = structureProblems(content, lastUserBubbleText());
 
     const panel = document.createElement('div');

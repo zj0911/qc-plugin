@@ -138,8 +138,9 @@
 .qc-locate-btn:hover { background: #1a73e8; color: #fff; }
 .qc-locate-btn:active { transform: scale(0.95); }
 
-/* 修改方式行右上角的复制按钮（绿色系，与修改方式行配色一致；布局仿定位按钮） */
-.qc-fix-copy-btn {
+/* 修改方式行右上角的采纳按钮（绿色系，与修改方式行配色一致；布局仿定位按钮）：
+   点击把该条修改方式替换进对比区「修改后」，替换内容为绿色高亮 */
+.qc-fix-adopt-btn {
   position: absolute;
   top: 9px;
   right: 9px;
@@ -154,46 +155,13 @@
   white-space: nowrap;
   transition: all 0.2s;
 }
-.qc-fix-copy-btn:hover { background: #43a047; color: #fff; }
-.qc-fix-copy-btn:active { transform: scale(0.95); }
-/* 编辑按钮：与复制按钮并排（复制在内、编辑靠边） */
-.qc-fix-edit-btn {
-  position: absolute;
-  top: 9px;
-  right: 78px;
-  padding: 3px 10px;
-  background: #fff;
-  color: #e65100;
-  border: 1px solid #fb8c00;
-  border-radius: 14px;
-  cursor: pointer;
-  font-size: 11.5px;
-  font-family: system-ui, sans-serif;
-  white-space: nowrap;
-  transition: all 0.2s;
-}
-.qc-fix-edit-btn:hover { background: #fb8c00; color: #fff; }
-.qc-fix-edit-btn:active { transform: scale(0.95); }
-/* 含复制/编辑按钮的修改方式行右侧留白，避免文字被按钮压住 */
-.qc-fix-row:has(.qc-fix-copy-btn) { padding-right: 152px; }
-/* 编辑态：正文换成 textarea，恢复常规内边距 */
-.qc-fix-row.qc-fix-editing { padding-right: 11px; }
-.qc-fix-edit-ta {
-  width: 100%; min-height: 96px; box-sizing: border-box;
-  padding: 8px 10px; border: 1px solid #43a047; border-radius: 6px;
-  font-family: "SF Mono", "Fira Code", Consolas, "Courier New", monospace;
-  font-size: 12.5px; line-height: 1.7; resize: vertical; background: #fff;
-}
-.qc-fix-edit-ta:focus { outline: none; border-color: #2e7d32; box-shadow: 0 0 0 2px rgba(67, 160, 71, 0.18); }
-.qc-fix-edit-bar { display: flex; gap: 8px; margin-top: 6px; }
-.qc-fix-edit-save, .qc-fix-edit-cancel {
-  padding: 4px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
-  transition: all 0.15s; border: 1px solid transparent;
-}
-.qc-fix-edit-save { background: #43a047; color: #fff; }
-.qc-fix-edit-save:hover { background: #2e7d32; }
-.qc-fix-edit-cancel { background: #fff; color: #5f6368; border-color: #d0d5dc; }
-.qc-fix-edit-cancel:hover { background: #f1f3f4; }
+.qc-fix-adopt-btn:hover { background: #43a047; color: #fff; }
+.qc-fix-adopt-btn:active { transform: scale(0.95); }
+/* 已采纳态：实心绿底，提示该条已替换进「修改后」；再点取消采纳 */
+.qc-fix-adopt-btn.qc-adopted { background: #43a047; color: #fff; }
+.qc-fix-adopt-btn.qc-adopted:hover { background: #2e7d32; }
+/* 含采纳按钮的修改方式行右侧留白，避免文字被按钮压住 */
+.qc-fix-row:has(.qc-fix-adopt-btn) { padding-right: 96px; }
 
 /* 卡片头部的「🎯 质检点」跳转按钮（标题 flex:1 已把按钮推到行尾） */
 .qc-jump-btn {
@@ -223,9 +191,8 @@
 @media (max-width: 700px) {
   .qc-locate-row { padding-right: 11px; }
   .qc-locate-btn { position: static; margin-top: 6px; }
-  .qc-fix-row:has(.qc-fix-copy-btn) { padding-right: 11px; }
-  .qc-fix-copy-btn { position: static; margin-top: 6px; }
-  .qc-fix-edit-btn { position: static; margin-top: 6px; margin-left: 6px; }
+  .qc-fix-row:has(.qc-fix-adopt-btn) { padding-right: 11px; }
+  .qc-fix-adopt-btn { position: static; margin-top: 6px; }
 }
 
 /* ════════════════════════════════════
