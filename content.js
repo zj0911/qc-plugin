@@ -191,6 +191,99 @@
     return found ? found.index : -1;
   }
 
+  // ── 输出去重 ──────────────────────────────────────────────
+  // Agent 偶尔在同一条回复里把「优化结果」输出多遍：先输出带思考过程的草稿（"Let me …"），
+  // 再输出完整版，末尾有时又复述一遍微调版。整页提取从第一个标记切起（保留多轮合并语义），
+  // 重复块会被全部拼进结果——表现为同一批「第 N 条」出现两次、思考残留混进正文。
+  // 处理顺序：先按标记切块做块级去重，再剥掉保留文本中的思考残留行。
+  // 块级去重只丢弃「重复/草稿」块：双方都带规则 ID 且不同 → 一律保留，不影响多轮合并语义。
+  const THINK_LINE_RE = /^(?:let me\b|let's\b|let us\b|i'll\b|i will\b|i would\b|i need to\b|i should\b|i am going to\b|given the\b|draft content\b|okay[,，]?\s|alright[,，]?\s|now\s+(?:i|let)|first[,，]?\s*(?:i|let)|so\s+(?:i|let|now)|接下来我|现在我|让我|我来|我将|我需要|我先把|首先，?我|基于以上|综上，?我|我整理一下|我梳理一下|我逐条)/i;
+
+  // 剥思考残留行（Let me … / 让我 … 等过程性语句，不属于结果正文）
+  function stripThinkLines(text) {
+    return text.split('\n')
+      .filter((l) => !THINK_LINE_RE.test(l.trim()))
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n');
+  }
+
+  // 归一化文本相似度（字符 bigram Dice 系数）：1 完全相同，0 完全不同。
+  // 过短片段（<20 字符）不参与相似判定，防误伤短条目。
+  function qcTextSim(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.length < 20 || b.length < 20) return 0;
+    const grams = (s) => {
+      const m = new Map();
+      for (let i = 0; i < s.length - 1; i++) {
+        const g = s.slice(i, i + 2);
+        m.set(g, (m.get(g) || 0) + 1);
+      }
+      return m;
+    };
+    const ga = grams(a), gb = grams(b);
+    let la = 0, lb = 0, inter = 0;
+    ga.forEach((v) => { la += v; });
+    gb.forEach((v) => { lb += v; });
+    ga.forEach((v, g) => { const w = gb.get(g); if (w) inter += Math.min(v, w); });
+    return (2 * inter) / (la + lb);
+  }
+
+  // a 的有信息行（去空白后）被 b 包含的比例，草稿片段检测用
+  function qcSubsetRatio(aLines, bNorm) {
+    if (!aLines.length || !bNorm) return 0;
+    let hit = 0;
+    for (const l of aLines) {
+      if (bNorm.indexOf(l.replace(/\s+/g, '')) !== -1) hit++;
+    }
+    return hit / aLines.length;
+  }
+
+  function dedupeResultBlocks(text) {
+    if (!text) return text;
+    const re = new RegExp(MARKER_PATTERN.source, 'g');
+    const marks = [];
+    let m;
+    while ((m = re.exec(text))) marks.push(m.index);
+    if (marks.length < 2) return stripThinkLines(text); // 单块：仅剥思考残留行
+
+    const blocks = marks.map((pos, i) => {
+      const raw = text.slice(pos, i + 1 < marks.length ? marks[i + 1] : text.length);
+      const allLines = raw.split('\n');
+      const ridM = raw.match(/规则\s*ID\s*[：:]\s*([A-Za-z]*\d+)/i);
+      return {
+        raw,
+        // 有信息行：排除标记行/思考残留行/过短行，用于子集判定
+        lines: allLines.map((l) => l.trim())
+          .filter((l) => l.length >= 6 && !MARKER_PATTERN.test(l) && !THINK_LINE_RE.test(l)),
+        think: allLines.filter((l) => THINK_LINE_RE.test(l.trim())).length,
+        norm: raw.replace(MARKER_PATTERN, '').toLowerCase().replace(/\s+/g, ''),
+        rid: ridM ? ridM[1] : ''
+      };
+    });
+
+    const drop = new Array(blocks.length).fill(false);
+    for (let i = 0; i < blocks.length - 1; i++) {
+      if (drop[i]) continue;
+      const A = blocks[i];
+      for (let j = i + 1; j < blocks.length; j++) {
+        if (drop[j]) continue;
+        const B = blocks[j];
+        // 双方都带规则 ID 且不同 → 是不同轮次的不同结果，保留
+        if (A.rid && B.rid && A.rid !== B.rid) continue;
+        // ① 草稿块：思考残留 ≥ 2 行（边想边输出的中间稿），后面有完整块 → 丢弃
+        if (A.think >= 2) { drop[i] = true; break; }
+        // ② 近重复：相似度极高 → 只保留最后一个（Agent 的最终版）
+        if (qcTextSim(A.norm, B.norm) >= 0.85) { drop[i] = true; break; }
+        // ③ 草稿片段：内容行几乎都被后面的块包含 → 丢弃
+        if (qcSubsetRatio(A.lines, B.norm) >= 0.85) { drop[i] = true; break; }
+      }
+    }
+    const kept = [];
+    blocks.forEach((b, i) => { if (!drop[i]) kept.push(stripThinkLines(b.raw)); });
+    return kept.length ? kept.join('\n\n') : stripThinkLines(text);
+  }
+
   function extractResult() {
     const userRows = collectChatUserRows();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
@@ -203,7 +296,8 @@
 
     const idx = firstMarkerIndex(text); //zj 把:const idx = lastMarkerIndex(text);改成:const idx = firstMarkerIndex(text);
     if (idx < 0) return null;
-    return sliceResultText(text.slice(idx));
+    // 先块级去重（草稿/重复的「优化结果」块只保留最终版），再做尾部噪音截断与长度校验
+    return sliceResultText(dedupeResultBlocks(text.slice(idx)));
   }
 
   // 原始文本归一化：修复标题粘连、列表符换行丢失、标点粘连等排版问题
@@ -364,6 +458,7 @@
 
     const problems = [];
     const seen = new Set(); // 指纹去重：同一条目在页面上重复出现（新旧气泡残留/双份结果块）时只保留第一份
+    const seenNum = new Map(); // 条号 → 首个条目的字段指纹：近重复去重（同条号且内容高度相似 = 同一条的复述微调版）
     for (let i = 0; i < titles.length; i++) {
       const start = titles[i];
       const end = (i + 1 < titles.length) ? titles[i + 1] : t.length;
@@ -384,6 +479,16 @@
       if (desc || locate || fix) {
         const fp = (locate + '|' + desc + '|' + fix).replace(/\s+/g, '');
         if (seen.has(fp)) continue;
+        // 同条号近重复：措辞略有差异的复述版（指纹不同但相似度 ≥ 0.8）也视为重复，保留首份；
+        // 不同轮次里内容实质不同的同条号条目（相似度低）不受影响，仍全部保留
+        const numM = title.match(/第\s*(\d+)\s*条/);
+        if (numM) {
+          const num = numM[1];
+          const fpNorm = fp.toLowerCase();
+          const prevFp = seenNum.get(num);
+          if (prevFp && qcTextSim(prevFp, fpNorm) >= 0.8) continue;
+          seenNum.set(num, fpNorm);
+        }
         seen.add(fp);
         problems.push({ title, type, locate, desc, fix, qcRefs, qcBizLine });
       }
@@ -1974,7 +2079,7 @@
       .replace(/(?<=[一-龥])[ \t]+(?=[一-龥])/g, '');
     const norm = normalizeExtractText(scrubbed);
     const markerIdx = firstMarkerIndex(norm);
-    const refined = markerIdx >= 0 ? sliceResultText(norm.slice(markerIdx), 60) : null;
+    const refined = markerIdx >= 0 ? sliceResultText(dedupeResultBlocks(norm.slice(markerIdx)), 60) : null;
     let problems = refined ? structureProblems(refined, promptCtx) : [];
     if (!problems.length) problems = structureProblems(norm, promptCtx);
 
@@ -2843,8 +2948,29 @@
     return { start, end, score: Math.min(0.9, (best.cnt * step) / L), mode: 'chunk', chunkHits: best.cnt };
   }
 
+  // ⑥ 锚点辅助：在内容流 a 与 b 里找最长公共连续子串（O(n·m)，仅兜底时走一次）。
+  // 返回 { start: 在 b 中的起点, len } ；找不到 ≥ 最小长度返回 null。
+  function lcsAnchor(a, b) {
+    if (!a || !b || a.length * b.length === 0) return null;
+    const MIN = 6;
+    let best = { len: 0, start: 0, ai: 0 };
+    // 简单对角 DP：只保留上一行，O(n·m) 时间、O(m) 空间
+    const n = a.length, m = b.length;
+    const prev = new Array(m + 1).fill(0);
+    const cur = new Array(m + 1).fill(0);
+    for (let i = 0; i < n; i++) {
+      for (let j = 0; j < m; j++) {
+        if (a[i] === b[j]) { cur[j + 1] = prev[j] + 1; } else { cur[j + 1] = 0; }
+        if (cur[j + 1] > best.len) { best = { len: cur[j + 1], start: j + 1 - cur[j + 1], ai: i + 1 - cur[j + 1] }; }
+      }
+      prev.splice(0); for (let j = 0; j <= m; j++) prev[j] = cur[j];
+    }
+    if (best.len < MIN) return null;
+    return { len: best.len, start: best.start }; // start 是 b 中的起点（内容下标）
+  }
+
   // 在文本中定位 locateField，返回 {start,end,score,mode}（原始偏移）或 null。
-  // 五级候选取最优：整体精确 → 整行锚点 → 整体滑窗 → 逐行滑窗 → 短块聚类。
+  // 六级候选取最优：整体精确 → 整行锚点 → 整体滑窗 → 逐行滑窗 → 短块聚类 → LCS 锚点。
   // 低分候选也返回（score 字段区分），由调用方决定"合并 adoption"还是"仅滚动提示"
   function cmpFindRange(text, locateField, fromOffset) {
     if (!text || !locateField) return null;
@@ -2899,6 +3025,15 @@
     // ⑤ 短块聚类探测
     const cp = cmpChunkProbe(target, sub);
     if (cp) cands.push({ start: cp.start + fromC, end: cp.end + fromC, score: cp.score, mode: cp.mode });
+    // ⑥ 最长公共连续子串锚点（整段改写兜底）：target 是 Agent 改写后的概括，原文无逐字句，
+    //    ①~⑤ 全空时仍找 ≥6 字连续公共片段，以其位置为锚扩到 ≈target 长度滚动过去。
+    const lcs = lcsAnchor(target, sub);
+    if (lcs && lcs.len >= 6) {
+      const pad = Math.max(20, Math.floor((target.length - lcs.len) / 2));
+      const s6 = Math.max(0, lcs.start - pad);
+      const e6 = Math.min(sub.length, lcs.start + lcs.len + pad);
+      cands.push({ start: s6 + fromC, end: e6 + fromC, score: 0.35, mode: 'lcs' });
+    }
     if (!cands.length) return null;
     cands.sort((a, b) => b.score - a.score);
     const best = cands[0];
