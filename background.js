@@ -402,13 +402,21 @@ function qcDeepLongest(node) {
 }
 
 // 在 queryRuleByPage 合并缓存（多份响应 payload）里找出目标规则对象：
-// 递归遍历，按「含质检点编码 +10 / 含业务线 +6」打分，同分取最长正文者
+// 递归遍历，按「标识字段命中编码(强) / 正文命中编码(中) / 含业务线(弱)」三档打分；
+// 命中前提 = 对象任意字符串真正包含目标编码；正文抽取强制命中核心内容，杜绝"最长字符串"串到其它质检点。
+// 修复点：旧实现把「仅正文最长」当兜底 → 搜 G01 会拿到同对象里更长的 G04 正文。
 function qcFindRule(dataArr, code, bizName) {
-  const re = (code && code.prefix)
-    ? new RegExp('(?<![A-Za-z])' + code.prefix.toUpperCase().split('').map(qcEscRe).join('\\s*[-—–]?\\s*') +
-        '\\s*[-—–]?\\s*0*' + code.digits + '(?![0-9])', 'i')
+  // 编码正则：优先解析后的 prefix+digits（例如 G1 / CO1，允许前导 0 → 兼容 G01），否则原样；
+  // 收紧边界：数字段前用 0* 语义、后跟 (?![0-9])，确保只精确命中该编码，不落入 G04/G017 等相邻编码。
+  //   - G01 / G1 / G-1 / 客户G01开户 → 命中
+  //   - G04 / G017 / 49-02-G04      → 不命中
+  const re = (code && code.prefix && /^[A-Z]{1,2}$/.test(code.prefix))
+    ? new RegExp('(?<![A-Za-z0-9])' + qcEscRe(code.prefix) +
+        '\\s*[-—–:： ]?\\s*0*' + code.digits + '(?![0-9])', 'i')
     : new RegExp('(?<![A-Za-z0-9])' + qcEscRe(String(code)) + '(?![A-Za-z0-9])', 'i');
   const nb = bizName ? qcNorm(bizName) : '';
+  // 标识字段（标题/名称/编码列）：这里出现目标编码 → 该条规则很可能是"编码自身"的载体
+  const idRe = /^(title|name|ruleName|ruleCode|qcRuleCode|code|qcCode|ruleId|qcRuleId|id|bizLine)$/i;
   const cands = [];
   const visit = (node, depth) => {
     if (!node || typeof node !== 'object' || depth > 9) return;
@@ -416,14 +424,16 @@ function qcFindRule(dataArr, code, bizName) {
     const strs = qcShallowStrings(node);
     if (strs.length) {
       const joined = strs.join('\n');
-      let score = 0;
-      if (re.test(joined)) score += 10;
-      if (nb && qcNorm(joined).indexOf(nb) !== -1) score += 6;
-      if (score > 0) {
-        let longest = '';
-        for (const s of strs) if (s.length > longest.length) longest = s;
-        cands.push({ obj: node, score, longest });
+      // 先判"标识字段是否命中编码"，优先于"正文里散现编码" → 避免长正文容器抢位
+      let identHit = false;
+      for (const k of Object.keys(node)) {
+        if (idRe.test(k) && typeof node[k] === 'string' && re.test(node[k])) { identHit = true; break; }
       }
+      let score = 0;
+      if (identHit) score += 34;              // 强：规则标题/编码列即是目标
+      else if (re.test(joined)) score += 14;  // 中：对象内某字段含目标编码
+      if (nb && qcNorm(joined).indexOf(nb) !== -1) score += 6; // 弱：业务线
+      if (score > 0) cands.push({ obj: node, score, joined });
     }
     for (const k of Object.keys(node)) {
       try { visit(node[k], depth + 1); } catch (e) { /* 循环引用防御 */ }
@@ -431,8 +441,11 @@ function qcFindRule(dataArr, code, bizName) {
   };
   (Array.isArray(dataArr) ? dataArr : [dataArr]).forEach(p => visit(p, 0));
   if (!cands.length) return null;
-  cands.sort((a, b) => (b.score - a.score) || (b.longest.length - a.longest.length));
+  // 定胜负：分高者胜；同分取"标识字段命中"优先（score 已体现），再取正文更贴合者
+  cands.sort((a, b) => (b.score - a.score) || (bodyLen(b) - bodyLen(a)));
   const best = cands[0];
+  // 正文候选：对象中「包含目标编码」且长度足够的长字段；若只凭标识字段命中而无正文，回退到最长正文
+  function bodyLen(c) { try { let m = 0; for (const s of qcShallowStrings(c.obj)) if (s.length > m) m = s.length; return m; } catch (e) { return 0; } }
   // qcRuleId：优先 ruleId 类字段，其次纯数字 id 字段（getRuleVersionHistory 入参）
   let ruleId = '';
   try {
@@ -459,18 +472,27 @@ function qcFindRule(dataArr, code, bizName) {
       if (typeof v === 'string' && v && v.length < 100) { title = v; break; }
     }
   } catch (e) { /* 忽略 */ }
-  // 正文：优先含质检点编码的长字段，其次最长字段，最后深度搜索
+  // 正文抽取（关键修复）：必须取「确实包含目标编码」的字段。
+  // 旧实现：hitStr 找不到时退化为"最长字段"，会把同对象里 G04 的长正文取出来 → 搜索 G01 却拿到 G04。
+  // 新实现：① 只从「包含目标编码」的 ≥30 字字符串里选「最长者」作为该规则正文；
+  //         ② 若对象没有任何含编码的字符串 → 返回空 content（由调用方报 rule-not-found），
+  //            绝不拿"最长但不含编码"的字段顶替。
   let content = '';
-  try {
-    const strs = qcShallowStrings(best.obj).filter(s => s.length >= 80);
-    const hitStr = strs.find(s => re.test(s));
-    content = hitStr || (strs.length ? strs.reduce((a, b) => (b.length > a.length ? b : a)) : '');
-    if (content.length < 60) {
-      const deep = qcDeepLongest(best.obj);
-      if (deep.length > content.length) content = deep;
-    }
-  } catch (e) { /* 忽略 */ }
-  return { content, ruleId, title, score: best.score };
+  if (best) {
+    let bestStr = '';
+    try {
+      const strs = qcShallowStrings(best.obj).filter(s => s.length >= 30);
+      for (const s of strs) {
+        re.lastIndex = 0;
+        if (!re.test(s)) continue;
+        if (s.length > bestStr.length) bestStr = s; // 含编码的最长正文即目标规则正文
+      }
+    } catch (e) { /* 忽略 */ }
+    content = bestStr;
+  } else {
+    content = '';
+  }
+  return { content, ruleId, title, score: best ? best.score : 0 };
 }
 
 // 从 getRuleVersionHistory 响应中挑最新一版：
